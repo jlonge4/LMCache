@@ -1508,3 +1508,110 @@ def test_fallback_scatter_skips_slot_when_every_layer_is_skipped():
             gpu_context, resolved_groups, batch, 32, [0], shifted_layer_lo=[2]
         )
     assert ops.multi_layer_kv_transfer.call_args_list == []
+
+
+def test_shifted_layer_lo_skips_attention_groups_only():
+    """With the attention kernel set given, a standalone (aux) group keeps
+    lo=0 even when the skip set would otherwise be its leading layers."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.blend import _cb_shifted_layer_lo
+
+    kgm = _kgm([0, 1, 2], [3])  # group 1 = standalone aux plane (layer 3)
+    assert _cb_shifted_layer_lo(kgm, [0, 1], [0, 3], attention_kernel={0}) == [1, 0]
+    # Without the set (legacy callers) every staged group is eligible.
+    assert _cb_shifted_layer_lo(kgm, [0, 1], [0, 3]) == [1, 1]
+
+
+def test_split_plan_tables_keeps_per_step_order_and_remaps_groups():
+    """Splitting the flat tables by read group keeps chunk-major/group-minor
+    row order per step, remaps group indices onto the spec subset, and
+    recomputes the per-step CSR ends; aux and KV halves together cover the
+    whole plan."""
+    # Third Party
+    import numpy as np
+
+    # First Party
+    from lmcache.v1.multiprocess.modules.blend import _cb_split_plan_tables
+
+    # 2 read groups (pos 0 = attention with kernel groups 0,1; pos 1 = aux
+    # with kernel group 2); 3 chunks in steps of sizes 2,1; chunks 0,2 shifted.
+    n_read, n_groups = 2, 3
+    specs = ["A0", "A1", "X"]
+    chunks = [(0, True), (1, False), (2, True)]
+    staging = np.array(
+        [[c * 10 + g, 0, 0, 0] for c, _ in chunks for g in range(n_read)],
+        dtype=np.int64,
+    )
+    ropes = np.array(
+        [[g, c, 100, 200, 1] for c, sh in chunks if sh for g in range(n_groups)],
+        dtype=np.int64,
+    )
+    scatters = np.array(
+        [[g, c, c * 4, 4, 1 if sh else 0] for c, sh in chunks for g in range(n_groups)],
+        dtype=np.int64,
+    )
+    # steps: chunks {0,1} then {2}
+    step_offsets = np.array(
+        [
+            [2 * n_read, 1 * n_groups, 2 * n_groups],
+            [3 * n_read, 2 * n_groups, 3 * n_groups],
+        ],
+        dtype=np.int64,
+    )
+    tables = (staging, ropes, scatters, step_offsets)
+
+    aux = _cb_split_plan_tables(specs, tables, n_read, [1], [2])
+    kv = _cb_split_plan_tables(specs, tables, n_read, [0], [0, 1])
+    assert aux is not None and kv is not None
+    aux_specs, (a_st, a_rp, a_sc, a_so) = aux
+    kv_specs, (k_st, k_rp, k_sc, k_so) = kv
+    assert aux_specs == ["X"] and kv_specs == ["A0", "A1"]
+    # Staging rows: aux keeps read pos 1 of every chunk, KV keeps pos 0.
+    assert a_st[:, 0].tolist() == [1, 11, 21]
+    assert k_st[:, 0].tolist() == [0, 10, 20]
+    # Rope/scatter rows filtered by kernel group and remapped to the subset.
+    assert a_rp[:, 0].tolist() == [0, 0] and a_rp[:, 1].tolist() == [0, 2]
+    assert k_rp[:, 0].tolist() == [0, 1, 0, 1] and k_rp[:, 1].tolist() == [0, 0, 2, 2]
+    assert a_sc[:, 0].tolist() == [0, 0, 0] and a_sc[:, 1].tolist() == [0, 1, 2]
+    assert k_sc[:, 0].tolist() == [0, 1, 0, 1, 0, 1]
+    # Per-step CSR ends recomputed for the subset sizes.
+    assert a_so.tolist() == [[2, 1, 2], [3, 2, 3]]
+    assert k_so.tolist() == [[2, 2, 4], [3, 4, 6]]
+    # Halves cover the whole plan.
+    assert a_st.shape[0] + k_st.shape[0] == staging.shape[0]
+    assert a_rp.shape[0] + k_rp.shape[0] == ropes.shape[0]
+    assert a_sc.shape[0] + k_sc.shape[0] == scatters.shape[0]
+    # Empty selections are refused.
+    assert _cb_split_plan_tables(specs, tables, n_read, [], [2]) is None
+
+
+def test_cb_retrieve_handler_signature_matches_protocol():
+    """The MQ server refuses a handler whose annotations differ from the
+    protocol table (payload classes AND response class, compared by
+    equality). Pin the blend retrieve handler to CB_RETRIEVE_PRE_COMPUTED so
+    a protocol change cannot ship without the handler (the 3-tuple response
+    was first caught only at server boot)."""
+    # Standard
+    import inspect
+    from typing import get_type_hints
+
+    # First Party
+    from lmcache.v1.multiprocess.modules import blend as blend_mod
+    from lmcache.v1.multiprocess.protocol import (
+        RequestType,
+        get_payload_classes,
+        get_response_class,
+    )
+
+    handler = blend_mod.BlendModule.cb_retrieve_pre_computed
+    hints = get_type_hints(handler)
+    params = [
+        p
+        for p in inspect.signature(handler).parameters.values()
+        if p.name != "self"
+        and p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    payload = get_payload_classes(RequestType.CB_RETRIEVE_PRE_COMPUTED)
+    assert [hints[p.name] for p in params] == payload
+    assert hints["return"] == get_response_class(RequestType.CB_RETRIEVE_PRE_COMPUTED)

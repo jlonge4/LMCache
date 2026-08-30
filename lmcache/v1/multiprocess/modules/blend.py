@@ -665,8 +665,70 @@ def _classify_cb_read_groups(
     )
 
 
+def _cb_split_plan_tables(
+    group_specs: list[Any],
+    tables: "tuple[Any, Any, Any, Any]",
+    n_read: int,
+    read_sel: list[int],
+    kernel_sel: list[int],
+) -> "tuple[list[Any], tuple[Any, Any, Any, Any]] | None":
+    """Restrict a flat retrieve plan to a subset of its read groups.
+
+    The tables are chunk-major with the group minor (staging: one row per
+    (chunk, read group); ropes/scatters: one row per (chunk, staged kernel
+    group)), so filtering rows by group keeps every per-step ordering
+    invariant of ``execute_cb_retrieve_plan_flat`` and only the per-step CSR
+    ends need recomputing. Group indices are remapped onto the returned spec
+    subset. Used to run the standalone-aux group's H2D + scatter (and record
+    its own event) ahead of the attention groups'.
+
+    Args:
+        group_specs: Staged kernel-group specs, in staged order.
+        tables: ``(staging, ropes, scatters, step_offsets)`` for every group.
+        n_read: Number of read object groups (staging rows per chunk).
+        read_sel: Read-group positions to keep (staging rows).
+        kernel_sel: Staged kernel-group positions to keep (rope/scatter rows).
+
+    Returns:
+        ``(specs_subset, tables_subset)``, or None when the selection is
+        empty.
+    """
+    if not read_sel or not kernel_sel:
+        return None
+    staging, ropes, scatters, step_offsets = tables
+    n_groups = len(group_specs)
+    ends = np.asarray(step_offsets, dtype=np.int64)
+    starts = np.vstack([np.zeros((1, 3), dtype=np.int64), ends[:-1]])
+    counts = ends - starts  # per step: staging rows, rope rows, scatter rows
+    chunks_per_step = counts[:, 0] // max(1, n_read)
+    shifted_per_step = counts[:, 1] // max(1, n_groups)
+    remap = np.full(n_groups, -1, dtype=np.int64)
+    remap[np.asarray(kernel_sel, dtype=np.int64)] = np.arange(len(kernel_sel))
+    st_mask = np.isin(np.arange(staging.shape[0]) % max(1, n_read), read_sel)
+    rp_mask = np.isin(ropes[:, 0], kernel_sel) if ropes.shape[0] else np.zeros(0, bool)
+    sc_mask = np.isin(scatters[:, 0], kernel_sel)
+    ropes_sub = ropes[rp_mask].copy()
+    scatters_sub = scatters[sc_mask].copy()
+    if ropes_sub.shape[0]:
+        ropes_sub[:, 0] = remap[ropes_sub[:, 0]]
+    scatters_sub[:, 0] = remap[scatters_sub[:, 0]]
+    new_ends = np.stack(
+        [
+            np.cumsum(chunks_per_step * len(read_sel)),
+            np.cumsum(shifted_per_step * len(kernel_sel)),
+            np.cumsum(chunks_per_step * len(kernel_sel)),
+        ],
+        axis=1,
+    )
+    specs = [group_specs[i] for i in kernel_sel]
+    return specs, (staging[st_mask], ropes_sub, scatters_sub, new_ends)
+
+
 def _cb_shifted_layer_lo(
-    kgm: Any, staged_kernel: list[int], skip_layer_indices: list[int]
+    kgm: Any,
+    staged_kernel: list[int],
+    skip_layer_indices: list[int],
+    attention_kernel: "set[int] | None" = None,
 ) -> list[int]:
     """Translate skipped registered-layer indices into per-kernel-group
     leading-layer counts for the shifted-match scatter.
@@ -685,6 +747,11 @@ def _cb_shifted_layer_lo(
         skip_layer_indices: Registered KV-tensor indices to skip for shifted
             matches; empty means skip nothing.
 
+        attention_kernel: Kernel-group indices of the attention object
+            group. When given, only those groups skip; a standalone (adapter
+            aux) group always scatters whole -- its consumer validates and
+            decodes pages host-side, so a partial page is never wanted.
+
     Returns:
         One ``layer_lo`` per staged kernel group (0 = scatter every layer).
 
@@ -698,6 +765,9 @@ def _cb_shifted_layer_lo(
     skip = {int(i) for i in skip_layer_indices}
     out: list[int] = []
     for group_idx in staged_kernel:
+        if attention_kernel is not None and group_idx not in attention_kernel:
+            out.append(0)
+            continue
         layer_indices = list(kgm.kernel_groups[group_idx].layer_indices)
         local = [pos for pos, li in enumerate(layer_indices) if li in skip]
         if local != list(range(len(local))):
@@ -2706,7 +2776,7 @@ class BlendModule(InstanceLivenessTarget):
         # Annotation must equal the protocol payload class exactly (see
         # cb_register_rope's group_rot).
         skip_layer_indices: list[int] = _EMPTY_SKIP_LAYERS,
-    ) -> tuple[bytes, bool]:
+    ) -> tuple[bytes, bool, bytes]:
         """Scatter every matched token range into the request's paged KV.
 
         Reuses the lookup's prefetched chunks: fills tmp slots, K-only re-RoPEs
@@ -2736,8 +2806,11 @@ class BlendModule(InstanceLivenessTarget):
                 layer. Empty = scatter everything.
 
         Returns:
-            tuple[bytes, bool]: The scatter-complete event handle and whether
-            the scatter ran (False if the prefetched objects were unavailable).
+            tuple[bytes, bool, bytes]: The scatter-complete event handle,
+            whether the scatter ran (False if the prefetched objects were
+            unavailable), and the standalone-aux group's own completion
+            handle (empty when the read set has no such group; equal to the
+            KV handle when the aux could not be fenced separately).
 
         Raises:
             ValueError: If the instance has no registered KV cache or rope
@@ -2760,14 +2833,48 @@ class BlendModule(InstanceLivenessTarget):
         # groups. Legacy fused layout: object group 0, every kernel group.
         read_groups, staged_kernel = self._cb_staged_groups(gpu_context)
         n_read = len(read_groups.gids)
-        # Per staged kernel group: leading layers a shifted match skips.
-        shifted_layer_lo = _cb_shifted_layer_lo(
-            gpu_context.kv_layer_groups_manager, staged_kernel, skip_layer_indices
+        # Per staged kernel group: leading layers a shifted match skips
+        # (attention groups only; the standalone aux group scatters whole).
+        _kgm = gpu_context.kv_layer_groups_manager
+        attention_kernel = set(
+            _kgm.object_groups[read_groups.attn_gid].kernel_group_indices
         )
+        shifted_layer_lo = _cb_shifted_layer_lo(
+            _kgm, staged_kernel, skip_layer_indices, attention_kernel
+        )
+        # Adapter aux plane(s): the connector-injected fused-aux pool (tagged
+        # extra group) or any kernel group outside the attention object
+        # group. The worker host-validates them before its forward, so they
+        # need a fence it can host-sync without also waiting for the bulk KV
+        # scatter. Separated layout (aux in its own read object group): the
+        # plan is split, aux first, fenced by its own event. Fused layout (one
+        # object per chunk, every plane in one H2D blob): nothing to split --
+        # the aux fence is the KV fence and the worker syncs everything.
+        aux_kernel = {
+            ki
+            for ki in staged_kernel
+            if ki not in attention_kernel
+            or int(getattr(_kgm.kernel_groups[ki], "extra_object_group_tag", 0)) > 0
+        }
+        aux_read_pos = [
+            pos
+            for pos, gid in enumerate(read_groups.gids)
+            if gid != read_groups.attn_gid
+        ]
+        aux_kernel_pos = [
+            pos for pos, ki in enumerate(staged_kernel) if ki in aux_kernel
+        ]
+        kv_kernel_pos = [
+            pos for pos, ki in enumerate(staged_kernel) if ki not in aux_kernel
+        ]
+        aux_event: "Any | None" = None
+        aux_split = False
 
         _retrieve_t0 = time.perf_counter()
 
-        def _noop_success(reason: str = "?", detail: str = "") -> tuple[bytes, bool]:
+        def _noop_success(
+            reason: str = "?", detail: str = ""
+        ) -> tuple[bytes, bool, bytes]:
             """Return a zero-work success, publishing CB_RETRIEVE_NOOP.
 
             The request silently falls back to a full recompute, so the event is
@@ -2820,7 +2927,7 @@ class BlendModule(InstanceLivenessTarget):
                     session_id=key.request_id,
                 )
             )
-            return handle, True
+            return handle, True, b""
 
         cb_match_result = sorted(cb_match_result, key=lambda r: r.cur_st)
         # vLLM may call retrieve twice (partial- then full-block alloc). KV
@@ -3048,7 +3155,7 @@ class BlendModule(InstanceLivenessTarget):
                             ),
                         )
                         event.record()
-                        return event.ipc_handle(), False
+                        return event.ipc_handle(), False, b""
 
                     # Per-token scatter handles any cur_st. Each match owns n_read
                     # consecutive memory objects (chunk-major).
@@ -3139,12 +3246,54 @@ class BlendModule(InstanceLivenessTarget):
                         execute_cb_retrieve_plan_flat = (
                             device_ops.execute_cb_retrieve_plan_flat
                         )
-                        execute_cb_retrieve_plan_flat(
-                            gpu_context.device,
-                            LazyMemoryAllocator.PIN_CHUNK_SIZE,
-                            plan_group_specs,
-                            *plan_tables,
-                        )
+                        split = None
+                        if aux_read_pos and kv_kernel_pos:
+                            aux_part = _cb_split_plan_tables(
+                                plan_group_specs,
+                                plan_tables,
+                                n_read,
+                                aux_read_pos,
+                                aux_kernel_pos,
+                            )
+                            kv_part = _cb_split_plan_tables(
+                                plan_group_specs,
+                                plan_tables,
+                                n_read,
+                                [
+                                    pos
+                                    for pos in range(n_read)
+                                    if pos not in aux_read_pos
+                                ],
+                                kv_kernel_pos,
+                            )
+                            if aux_part is not None and kv_part is not None:
+                                split = (aux_part, kv_part)
+                        if split is not None:
+                            # Aux group first, fenced by its own event; the
+                            # attention groups follow behind the KV event.
+                            aux_split = True
+                            (aux_specs, aux_tables), (kv_specs, kv_tables) = split
+                            execute_cb_retrieve_plan_flat(
+                                gpu_context.device,
+                                LazyMemoryAllocator.PIN_CHUNK_SIZE,
+                                aux_specs,
+                                *aux_tables,
+                            )
+                            aux_event = torch_dev.Event(interprocess=True)
+                            aux_event.record()
+                            execute_cb_retrieve_plan_flat(
+                                gpu_context.device,
+                                LazyMemoryAllocator.PIN_CHUNK_SIZE,
+                                kv_specs,
+                                *kv_tables,
+                            )
+                        else:
+                            execute_cb_retrieve_plan_flat(
+                                gpu_context.device,
+                                LazyMemoryAllocator.PIN_CHUNK_SIZE,
+                                plan_group_specs,
+                                *plan_tables,
+                            )
                         _stage_ms["exec"] = (time.perf_counter() - _stage_t) * 1000
                         runs = []  # plan covers every wave; skip the loop
 
@@ -3265,9 +3414,18 @@ class BlendModule(InstanceLivenessTarget):
                 # Valid server event + False (never echo the client handle; see
                 # the memory_objs-None path above).
                 event.record()
-                return event.ipc_handle(), False
+                return event.ipc_handle(), False, b""
 
             event.record()
+            # Aux fence: its own event when the plan was split, else the KV
+            # event (whole-scatter sync) when a standalone group exists, else
+            # empty (nothing for the worker to host-validate).
+            if aux_event is not None:
+                aux_handle = aux_event.ipc_handle()
+            elif aux_kernel:
+                aux_handle = event.ipc_handle()
+            else:
+                aux_handle = b""
             self._event_bus.publish_on_stream(
                 gpu_context.cupy_stream,
                 Event(
@@ -3292,13 +3450,15 @@ class BlendModule(InstanceLivenessTarget):
         logger.info(
             "Retrieved pre-computed for %d match results into request %s "
             "paged blocks (scatter_ms=%.2f, non_shifted=%d shifted=%d, "
-            "shifted_layer_lo=%s, stages_ms=%s)",
+            "shifted_layer_lo=%s, aux_groups=%d aux_split=%s, stages_ms=%s)",
             len(cb_match_result),
             key.request_id,
             _scatter_ms,
             n_non_shifted,
             n_shifted,
             shifted_layer_lo,
+            len(aux_kernel),
+            aux_split,
             {k: round(v, 1) for k, v in _stage_ms.items()},
         )
         self._event_bus.publish_on_stream(
@@ -3308,4 +3468,4 @@ class BlendModule(InstanceLivenessTarget):
                 session_id=key.request_id,
             ),
         )
-        return event.ipc_handle(), True
+        return event.ipc_handle(), True, aux_handle

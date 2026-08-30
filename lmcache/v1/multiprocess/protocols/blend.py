@@ -59,6 +59,11 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         # CacheBlend's FULL_RECOMP phase overwrites anyway. Non-shifted
         # (prefix-class) matches always land in every layer. Empty = every
         # layer, the pre-overlap behaviour.
+        # Returns: (kv_event_handle, scatter_ran, aux_event_handle). The KV
+        # handle completes after every group; the aux handle completes after
+        # the standalone (adapter aux) group alone, so a worker that defers
+        # its KV wait can still host-validate aux pages before the forward.
+        # Empty aux handle = no standalone group in the read set.
         "CB_RETRIEVE_PRE_COMPUTED": ProtocolDefinition(
             payload_classes=[
                 IPCCacheServerKey,
@@ -68,7 +73,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 bytes,
                 list[int],
             ],
-            response_class=tuple[bytes, bool],
+            response_class=tuple[bytes, bool, bytes],
             handler_type=HandlerType.BLOCKING,
         ),
         # Unified lookup: server runs prefix lookup + non-prefix fingerprint
