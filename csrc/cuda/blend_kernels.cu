@@ -67,14 +67,23 @@ void execute_cb_retrieve_plan(const torch::Device& device,
          ++group_idx) {
       const CBGroupSpec& group = group_specs[group_idx];
 
+      // One K-plane row is hidden_elems scalars; layer l of a slot starts at
+      // row l * slot_tokens. Both the rope and the scatter batches below are
+      // keyed by layer_lo: a fused launch shares one layer range, so a row
+      // with a different layer_lo flushes the pending batch first.
+      const int64_t layer_row_bytes = static_cast<int64_t>(group.slot_tokens) *
+                                      group.hidden_elems * group.element_size;
+
       if (group.cos_sin_cache != 0) {
+        int rope_lo = 0;
         const auto flush_ropes = [&]() {
           if (rope_keys.empty()) {
             return;
           }
           rotary_embedding_k_fused_ramp_multi_ptr(
               rope_keys, static_cast<at::ScalarType>(group.key_scalar_type),
-              static_cast<int64_t>(group.num_layers) * group.slot_tokens,
+              static_cast<int64_t>(group.num_layers - rope_lo) *
+                  group.slot_tokens,
               rope_old, rope_new, group.slot_tokens,
               static_cast<int64_t>(group.head_size), group.rope_head_stride,
               group.rope_num_kv_heads, group.cos_sin_cache, group.rot_dim,
@@ -91,14 +100,26 @@ void execute_cb_retrieve_plan(const torch::Device& device,
                           rope.slot_idx <
                               static_cast<int>(group.temp_buffer_ptrs.size()),
                       "CBRopeVar.slot_idx out of range: ", rope.slot_idx);
+          TORCH_CHECK(rope.layer_lo >= 0 && rope.layer_lo <= group.num_layers,
+                      "CBRopeVar.layer_lo out of range: ", rope.layer_lo);
+          if (rope.layer_lo == group.num_layers) {
+            continue;  // nothing to rotate
+          }
+          if (!rope_keys.empty() && rope.layer_lo != rope_lo) {
+            flush_ropes();
+          }
+          rope_lo = rope.layer_lo;
           // The K plane is the slot buffer's first plane, so its base pointer
           // is the slot base for both split K/V (kv_size 2) and fused-packed
           // / key-only (kv_size 1) layouts. rope_base_offset shifts the base
           // to the first rope-carrying element for layouts whose rope dims
-          // trail the row (MLA latents); 0 everywhere else.
+          // trail the row (MLA latents); 0 everywhere else. layer_lo skips
+          // whole layers: the ramp restarts every slot_tokens rows, so a
+          // layer-aligned base keeps positions intact.
           rope_keys.push_back(
               static_cast<uintptr_t>(group.temp_buffer_ptrs[rope.slot_idx]) +
-              static_cast<uintptr_t>(group.rope_base_offset));
+              static_cast<uintptr_t>(group.rope_base_offset) +
+              static_cast<uintptr_t>(rope.layer_lo * layer_row_bytes));
           rope_old.push_back(rope.old_st);
           rope_new.push_back(rope.cur_st);
           if (static_cast<int>(rope_keys.size()) == MAX_FUSED_TRANSFER_CHUNKS) {
@@ -108,6 +129,7 @@ void execute_cb_retrieve_plan(const torch::Device& device,
         flush_ropes();
       }
 
+      int sc_lo = 0;
       const auto flush_scatters = [&]() {
         if (sc_bufs.empty()) {
           return;
@@ -116,7 +138,7 @@ void execute_cb_retrieve_plan(const torch::Device& device,
             sc_bufs, sc_maps, sc_toks, group.paged_kv_ptrs, group.num_layers,
             group.slot_tokens, group.hidden_elems, group.element_size, device,
             group.page_buffer_size, TransferDirection::H2D,
-            group.engine_kv_format, group.block_size, group.head_size);
+            group.engine_kv_format, group.block_size, group.head_size, sc_lo);
         sc_bufs.clear();
         sc_maps.clear();
         sc_toks.clear();
@@ -132,6 +154,16 @@ void execute_cb_retrieve_plan(const torch::Device& device,
         TORCH_CHECK(scatter.n_tok >= 0 && scatter.n_tok <= group.slot_tokens,
                     "CBScatterVar.n_tok (", scatter.n_tok,
                     ") exceeds slot capacity ", group.slot_tokens);
+        TORCH_CHECK(
+            scatter.layer_lo >= 0 && scatter.layer_lo <= group.num_layers,
+            "CBScatterVar.layer_lo out of range: ", scatter.layer_lo);
+        if (scatter.layer_lo == group.num_layers) {
+          continue;  // every layer skipped
+        }
+        if (!sc_bufs.empty() && scatter.layer_lo != sc_lo) {
+          flush_scatters();
+        }
+        sc_lo = scatter.layer_lo;
         // Bounds-check the slot_mapping slice before the kernel dereferences
         // it on device: an out-of-range offset/length would otherwise be a
         // silent out-of-bounds device read (CUDA fault or garbage), not a

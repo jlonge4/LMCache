@@ -78,26 +78,46 @@ _CASES = {
 
 
 def _reference_scatter(
-    case, host_chunks, paged_ptrs, slot_mapping, old_sts, cur_sts, cos_sin
+    case,
+    host_chunks,
+    paged_ptrs,
+    slot_mapping,
+    old_sts,
+    cur_sts,
+    cos_sin,
+    layer_lo=0,
 ):
-    """Sequential per-chunk tensor-op reference (rope then scatter)."""
+    """Sequential per-chunk tensor-op reference (rope then scatter).
+
+    ``layer_lo`` applies to SHIFTED chunks only (old != cur): their leading
+    layers are neither rotated nor scattered, mirroring the planner's
+    ``shifted_layer_lo``; an unshifted chunk is scattered whole without a
+    rope (the planner emits no rope row for it).
+    """
     dev = slot_mapping.device
-    ramp = torch.arange(_SPC, device=dev, dtype=torch.long).repeat(_NL)
     for i, host in enumerate(host_chunks):
         buf = host.to(dev)
-        k_view = buf[0].reshape(_NL * _SPC, _NH, case.head_stride)
-        cuda_ops.rotary_embedding_k_fused_strided(
-            old_sts[i] + ramp,
-            cur_sts[i] + ramp,
-            k_view,
-            _HS,
-            case.head_stride,
-            cos_sin,
-            True,
-        )
+        shifted = old_sts[i] != cur_sts[i]
+        lo = layer_lo if shifted else 0
+        if lo >= _NL:
+            continue  # every layer skipped: the chunk leaves no trace
+        if shifted:
+            n_layers = _NL - lo
+            ramp = torch.arange(_SPC, device=dev, dtype=torch.long).repeat(n_layers)
+            k_view = buf[0][lo:].reshape(n_layers * _SPC, _NH, case.head_stride)
+            cuda_ops.rotary_embedding_k_fused_strided(
+                old_sts[i] + ramp,
+                cur_sts[i] + ramp,
+                k_view,
+                _HS,
+                case.head_stride,
+                cos_sin,
+                True,
+            )
+        kv = buf[:, lo:].contiguous() if lo else buf
         cuda_ops.multi_layer_kv_transfer(
-            buf,
-            paged_ptrs,
+            kv,
+            paged_ptrs[lo:],
             slot_mapping[i * _SPC : (i + 1) * _SPC],
             slot_mapping.device,
             _NB * _BS,
@@ -120,9 +140,16 @@ def _run_plan(
     cur_sts,
     cos_sin,
     slots,
+    layer_lo=None,
 ):
     """Drive the production flat-table entry point with the planner's
-    double-buffer wave layout."""
+    double-buffer wave layout.
+
+    ``layer_lo=None`` emits the legacy 4-column tables; an int emits the
+    5-column form with that ``layer_lo`` on every shifted chunk's rope and
+    scatter rows and 0 on unshifted chunks' scatter rows (which get no rope
+    row), exactly as ``_build_cb_retrieve_plan_flat`` does.
+    """
     chunk_bytes = case.kv_size * _NL * _SPC * case.hidden * _DTYPE.itemsize
     spec = cuda_ops.CBGroupSpec(
         paged_kv_ptrs=paged_ptrs.data_ptr(),
@@ -154,16 +181,23 @@ def _run_plan(
             staging.append(
                 (slots[slot].data_ptr(), host_chunks[ci].data_ptr(), chunk_bytes, 0)
             )
-            ropes.append((0, slot, old_sts[ci], cur_sts[ci]))
-            scatters.append((0, slot, ci * _SPC, _SPC))
+            shifted = old_sts[ci] != cur_sts[ci]
+            if layer_lo is None:
+                ropes.append((0, slot, old_sts[ci], cur_sts[ci]))
+                scatters.append((0, slot, ci * _SPC, _SPC))
+            else:
+                if shifted:
+                    ropes.append((0, slot, old_sts[ci], cur_sts[ci], layer_lo))
+                scatters.append((0, slot, ci * _SPC, _SPC, layer_lo if shifted else 0))
         step_offsets.append((len(staging), len(ropes), len(scatters)))
+    rope_cols = 4 if layer_lo is None else 5
     cuda_ops.execute_cb_retrieve_plan_flat(
         slot_mapping.device,
         1 << 26,
         [spec],
         np.asarray(staging, dtype=np.int64),
-        np.asarray(ropes, dtype=np.int64),
-        np.asarray(scatters, dtype=np.int64),
+        np.asarray(ropes, dtype=np.int64).reshape(-1, rope_cols),
+        np.asarray(scatters, dtype=np.int64).reshape(-1, rope_cols),
         np.asarray(step_offsets, dtype=np.int64),
     )
     torch_dev.synchronize()
@@ -227,3 +261,81 @@ def test_overlap_slot_reuse_is_bit_exact(n_chunks, max_batch, fmt_key):
             f"layer {layer} mismatch "
             f"(fmt={fmt_key}, n_chunks={n_chunks}, max_batch={max_batch})"
         )
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_CASES))
+@pytest.mark.parametrize("layer_lo", [1, 2, _NL])
+@pytest.mark.parametrize("n_chunks,max_batch", [(12, 4), (44, 16)])
+def test_layer_lo_skips_leading_layers_of_shifted_chunks(
+    n_chunks, max_batch, layer_lo, fmt_key
+):
+    """5-column tables: shifted chunks (every other one here) rotate and
+    scatter only layers ``[layer_lo, NL)``; the interleaved unshifted chunks
+    scatter every layer without a rope. Interleaving forces the executor's
+    per-launch ``layer_lo`` coalescing to flush on every change, and the
+    untouched layers of shifted chunks must stay exactly zero -- that is the
+    property CacheBlend's forward relies on (its FULL_RECOMP layers own
+    those slots while the scatter is still in flight)."""
+    case = _CASES[fmt_key]
+    dev = torch.device(torch_device_type)
+    torch.manual_seed(n_chunks * 7 + layer_lo)
+
+    paged_ref = [
+        torch.zeros(*case.paged_shape, dtype=_DTYPE, device=dev) for _ in range(_NL)
+    ]
+    paged_new = [torch.zeros_like(t) for t in paged_ref]
+    ptrs_ref = torch.tensor(
+        [t.data_ptr() for t in paged_ref], dtype=torch.long, device=dev
+    )
+    ptrs_new = torch.tensor(
+        [t.data_ptr() for t in paged_new], dtype=torch.long, device=dev
+    )
+    host_chunks = [
+        torch.randn(case.kv_size, _NL, _SPC, case.hidden, dtype=_DTYPE).pin_memory()
+        for _ in range(n_chunks)
+    ]
+    slots = [
+        torch.zeros(case.kv_size, _NL, _SPC, case.hidden, dtype=_DTYPE, device=dev)
+        for _ in range(max_batch)
+    ]
+    cos_sin = torch.randn(8192, _HS, dtype=_DTYPE, device=dev)
+    pos = torch.arange(0, n_chunks * _SPC, device=dev, dtype=torch.long)
+    block_ids = torch.arange(_NB, device=dev, dtype=torch.long).flip(0)
+    slot_mapping = block_ids[pos // _BS] * _BS + pos % _BS
+    cur_sts = [i * _SPC for i in range(n_chunks)]
+    old_sts = [c + 512 if i % 2 == 0 else c for i, c in enumerate(cur_sts)]
+
+    _reference_scatter(
+        case,
+        host_chunks,
+        ptrs_ref,
+        slot_mapping,
+        old_sts,
+        cur_sts,
+        cos_sin,
+        layer_lo=layer_lo,
+    )
+    _run_plan(
+        case,
+        n_chunks,
+        max_batch,
+        host_chunks,
+        ptrs_new,
+        slot_mapping,
+        old_sts,
+        cur_sts,
+        cos_sin,
+        slots,
+        layer_lo=layer_lo,
+    )
+
+    for layer in range(_NL):
+        assert torch.equal(paged_ref[layer], paged_new[layer]), (
+            f"layer {layer} mismatch (fmt={fmt_key}, lo={layer_lo}, "
+            f"n_chunks={n_chunks}, max_batch={max_batch})"
+        )
+    # The reference leaves the shifted chunks' leading layers at the zero
+    # fill, so the equality above proves the executor did not touch them;
+    # the unshifted neighbours still landed in every layer.
+    for layer in range(min(layer_lo, _NL)):
+        assert bool((paged_new[layer] != 0).any())

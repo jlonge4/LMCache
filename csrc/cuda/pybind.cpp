@@ -236,8 +236,12 @@ PYBIND11_MODULE(cuda_ops, m) {
   // CBRetrieveStep vectors in C++ (microseconds), replacing ~5 pybind object
   // constructions per chunk on the Python side. Tables:
   //   staging  [n_staging, 4]: dest, src, nbytes, host_offset
-  //   ropes    [n_ropes,  4]: group_idx, slot_idx, old_st, cur_st
-  //   scatters [n_scatter,4]: group_idx, slot_idx, slot_mapping_offset, n_tok
+  //   ropes    [n_ropes,  4|5]: group_idx, slot_idx, old_st, cur_st
+  //                             (, layer_lo)
+  //   scatters [n_scatter,4|5]: group_idx, slot_idx, slot_mapping_offset,
+  //                             n_tok (, layer_lo)
+  //   The optional 5th column is the per-row first layer to rotate/scatter
+  //   (see CBScatterVar::layer_lo); a 4-column table means layer_lo = 0.
   //   step_offsets [n_steps, 3]: end index into each table (exclusive,
   //   cumulative) after this step -- i.e. a per-kind CSR without the leading 0.
   m.def(
@@ -253,10 +257,14 @@ PYBIND11_MODULE(cuda_ops, m) {
              step_offsets) {
         TORCH_CHECK(staging.ndim() == 2 && staging.shape(1) == 4,
                     "staging table must be [n, 4]");
-        TORCH_CHECK(ropes.ndim() == 2 && ropes.shape(1) == 4,
-                    "ropes table must be [n, 4]");
-        TORCH_CHECK(scatters.ndim() == 2 && scatters.shape(1) == 4,
-                    "scatters table must be [n, 4]");
+        TORCH_CHECK(
+            ropes.ndim() == 2 && (ropes.shape(1) == 4 || ropes.shape(1) == 5),
+            "ropes table must be [n, 4] or [n, 5]");
+        TORCH_CHECK(scatters.ndim() == 2 &&
+                        (scatters.shape(1) == 4 || scatters.shape(1) == 5),
+                    "scatters table must be [n, 4] or [n, 5]");
+        const int64_t rcols = ropes.shape(1);
+        const int64_t ccols = scatters.shape(1);
         TORCH_CHECK(step_offsets.ndim() == 2 && step_offsets.shape(1) == 3,
                     "step_offsets table must be [n_steps, 3]");
         const int64_t* st = staging.data();
@@ -287,16 +295,19 @@ PYBIND11_MODULE(cuda_ops, m) {
           }
           step.ropes.reserve(r1 - r0);
           for (int64_t j = r0; j < r1; ++j) {
-            step.ropes.push_back(CBRopeVar{static_cast<int>(rp[j * 4 + 0]),
-                                           static_cast<int>(rp[j * 4 + 1]),
-                                           rp[j * 4 + 2], rp[j * 4 + 3]});
+            step.ropes.push_back(
+                CBRopeVar{static_cast<int>(rp[j * rcols + 0]),
+                          static_cast<int>(rp[j * rcols + 1]),
+                          rp[j * rcols + 2], rp[j * rcols + 3],
+                          rcols > 4 ? static_cast<int>(rp[j * rcols + 4]) : 0});
           }
           step.scatters.reserve(c1 - c0);
           for (int64_t j = c0; j < c1; ++j) {
-            step.scatters.push_back(
-                CBScatterVar{static_cast<int>(sc[j * 4 + 0]),
-                             static_cast<int>(sc[j * 4 + 1]), sc[j * 4 + 2],
-                             static_cast<int>(sc[j * 4 + 3])});
+            step.scatters.push_back(CBScatterVar{
+                static_cast<int>(sc[j * ccols + 0]),
+                static_cast<int>(sc[j * ccols + 1]), sc[j * ccols + 2],
+                static_cast<int>(sc[j * ccols + 3]),
+                ccols > 4 ? static_cast<int>(sc[j * ccols + 4]) : 0});
           }
           steps.push_back(std::move(step));
           s0 = s1;

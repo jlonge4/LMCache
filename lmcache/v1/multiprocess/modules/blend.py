@@ -110,6 +110,7 @@ _TORCH_TO_AT_SCALAR = {
 # Default for cb_register_rope's wire-typed group_rot parameter (legacy: no
 # declared windows). Never mutated — the handler only iterates it.
 _EMPTY_GROUP_ROT: list[list[int]] = []
+_EMPTY_SKIP_LAYERS: list[int] = []
 
 
 @dataclass
@@ -662,6 +663,51 @@ def _classify_cb_read_groups(
         recurrent_gids=tuple(recurrent),
         attn_gid=attn[0],
     )
+
+
+def _cb_shifted_layer_lo(
+    kgm: Any, staged_kernel: list[int], skip_layer_indices: list[int]
+) -> list[int]:
+    """Translate skipped registered-layer indices into per-kernel-group
+    leading-layer counts for the shifted-match scatter.
+
+    A kernel group iterates its layers in ``layer_indices`` order and the tmp
+    slot / paged pointer arrays follow that order, so "skip these layers" is
+    expressible to the scatter kernel only as a leading prefix
+    ``[0, layer_lo)`` of the group. The plugin sends the registered indices of
+    the decoder layers below its CHECK layer, which are the leading layers of
+    every group when registration order follows decoder order (vLLM's) --
+    validated here rather than assumed.
+
+    Args:
+        kgm: The context's ``KVLayerGroupsManager``.
+        staged_kernel: Kernel-group indices blend stages, in staged order.
+        skip_layer_indices: Registered KV-tensor indices to skip for shifted
+            matches; empty means skip nothing.
+
+    Returns:
+        One ``layer_lo`` per staged kernel group (0 = scatter every layer).
+
+    Raises:
+        ValueError: If a group's skipped layers are not its leading layers --
+            skipping them would need a per-layer mask, which the fused kernel
+            does not have, so the retrieve refuses rather than mis-scatter.
+    """
+    if not skip_layer_indices:
+        return [0] * len(staged_kernel)
+    skip = {int(i) for i in skip_layer_indices}
+    out: list[int] = []
+    for group_idx in staged_kernel:
+        layer_indices = list(kgm.kernel_groups[group_idx].layer_indices)
+        local = [pos for pos, li in enumerate(layer_indices) if li in skip]
+        if local != list(range(len(local))):
+            raise ValueError(
+                f"CB retrieve: skip_layer_indices {sorted(skip)} are not the "
+                f"leading layers of kernel group {group_idx} (layer order "
+                f"{layer_indices}); cannot skip a non-prefix layer set."
+            )
+        out.append(len(local))
+    return out
 
 
 def _narrow_attn_desc(
@@ -2179,6 +2225,7 @@ class BlendModule(InstanceLivenessTarget):
         batch: "list[tuple[CBMatchResult, Any]]",
         head_size: int,
         staged_kernel: list[int],
+        shifted_layer_lo: "list[int] | None" = None,
     ) -> None:
         """Scatter one tmp-slot batch into the paged KV, one launch per
         (kernel group, tmp slot), straight from each slot's contiguous buffer
@@ -2195,6 +2242,10 @@ class BlendModule(InstanceLivenessTarget):
             staged_kernel: Kernel-group indices blend staged (see
                 :meth:`_cb_staged_groups`); recurrent groups are absent and
                 never scattered.
+            shifted_layer_lo: Per staged group, leading layers a SHIFTED
+                slot skips (``_cb_shifted_layer_lo``); None = none. The slot
+                view is narrowed to ``[lo:]`` layers (one small copy) and the
+                pointer array sliced to match.
         """
         kgm = gpu_context.kv_layer_groups_manager
         tok_counts = [int(r.cur_ed - r.cur_st) for (r, _) in batch]
@@ -2217,19 +2268,35 @@ class BlendModule(InstanceLivenessTarget):
             # blocks than the full group, so gpu_context.num_blocks (group
             # 0's) would truncate the other groups' bounds check.
             page_buffer_size = kgm.kernel_groups[group_idx].shape_desc.nb * group_bs
+            group_lo = int(shifted_layer_lo[pos_idx]) if shifted_layer_lo else 0
+            kv_pointers = gpu_context.get_kernel_group_kv_pointers(group_idx)
             tok_off = 0
             for slot_idx, n_tok in enumerate(tok_counts):
                 key_value = gpu_context.get_temp_kernel_group_buffer(
                     slot_idx, group_idx
                 )
+                ptrs = kv_pointers
+                r = batch[slot_idx][0]
+                lo = group_lo if r.old_st != r.cur_st else 0
+                if lo:
+                    if lo >= int(key_value.shape[1]):
+                        tok_off += n_tok
+                        continue  # every layer of this slot skipped
+                    # Shifted chunk: drop the leading layers the forward
+                    # recomputes; the kernel takes num_layers from size(1).
+                    key_value = key_value[:, lo:]
+                    ptrs = kv_pointers[lo:]
                 if n_tok < key_value.shape[2]:
                     # Partial chunk: narrow to the real token count (the
-                    # kernel scatters size(2) tokens). Slicing dim 2 breaks
-                    # contiguity, so this one slot pays a small copy.
-                    key_value = key_value[:, :, :n_tok].contiguous()
+                    # kernel scatters size(2) tokens).
+                    key_value = key_value[:, :, :n_tok]
+                if not key_value.is_contiguous():
+                    # Slicing dims 1/2 breaks contiguity; this slot pays a
+                    # small copy.
+                    key_value = key_value.contiguous()
                 device_ops.multi_layer_kv_transfer(
                     key_value,
-                    gpu_context.get_kernel_group_kv_pointers(group_idx),
+                    ptrs,
                     slot_mapping[tok_off : tok_off + n_tok],
                     gpu_context.device,
                     page_buffer_size,
@@ -2414,11 +2481,18 @@ class BlendModule(InstanceLivenessTarget):
         cpu_block_tables: "list[tuple[np.ndarray, int]]",
         runs: "list[list[tuple[CBMatchResult, Any]]]",
         max_batch: int,
+        shifted_layer_lo: "list[int] | None" = None,
     ) -> "tuple[list[Any], tuple[Any, Any, Any, Any], list[torch.Tensor]] | None":
         """Build the whole native retrieve plan: eligibility gates, cached
         invariant specs stamped with this request's slot mappings, and the
         numpy-vectorized int64 work tables for
         ``execute_cb_retrieve_plan_flat`` (layouts in the pybind docstring).
+
+        Args:
+            shifted_layer_lo: Per staged kernel group, the leading layers a
+                SHIFTED match's rope + scatter skip (``_cb_shifted_layer_lo``);
+                None/absent = 0 everywhere. Non-shifted matches always
+                scatter every layer. Rides the tables' 5th column.
 
         Returns:
             ``(group_specs, (staging, ropes, scatters, step_offsets),
@@ -2457,6 +2531,15 @@ class BlendModule(InstanceLivenessTarget):
         num_groups = len(group_specs)
         n_read = len(og_sizes)
         wave = max_batch // 2
+        if shifted_layer_lo is None:
+            lo_per_group = np.zeros(num_groups, dtype=np.int64)
+        else:
+            if len(shifted_layer_lo) != num_groups:
+                raise ValueError(
+                    f"shifted_layer_lo has {len(shifted_layer_lo)} entries for "
+                    f"{num_groups} staged kernel group(s)."
+                )
+            lo_per_group = np.asarray(shifted_layer_lo, dtype=np.int64)
 
         n = len(pairs)
         # Per-chunk position columns plus per-(chunk, read group) source
@@ -2566,12 +2649,16 @@ class BlendModule(InstanceLivenessTarget):
             # NoPE: shifted matches need no re-RoPE; emit no rope rows.
             shifted = np.zeros_like(shifted)
         n_shifted = int(shifted.sum())
+        # 5th column: first layer to rotate/scatter (see CBScatterVar::layer_lo).
+        # Every rope row is a shifted chunk; a scatter row skips layers only
+        # when its chunk is shifted -- prefix-class chunks land everywhere.
         ropes = np.stack(
             [
                 np.tile(groups_arr, n_shifted),
                 np.repeat(slot_of[shifted], num_groups),
                 np.repeat(old_st[shifted], num_groups),
                 np.repeat(cur_st[shifted], num_groups),
+                np.tile(lo_per_group, n_shifted),
             ],
             axis=1,
         )
@@ -2581,6 +2668,11 @@ class BlendModule(InstanceLivenessTarget):
                 np.repeat(slot_of, num_groups),
                 np.repeat(tok_off, num_groups),
                 np.repeat(n_tok, num_groups),
+                np.where(
+                    np.repeat(old_st != cur_st, num_groups),
+                    np.tile(lo_per_group, n),
+                    0,
+                ),
             ],
             axis=1,
         )
@@ -2611,6 +2703,9 @@ class BlendModule(InstanceLivenessTarget):
         gpu_block_ids: list[list[int]],
         instance_id: int,
         event_ipc_handle: bytes,
+        # Annotation must equal the protocol payload class exactly (see
+        # cb_register_rope's group_rot).
+        skip_layer_indices: list[int] = _EMPTY_SKIP_LAYERS,
     ) -> tuple[bytes, bool]:
         """Scatter every matched token range into the request's paged KV.
 
@@ -2630,6 +2725,15 @@ class BlendModule(InstanceLivenessTarget):
                 Mirrors the engine RETRIEVE/STORE per-group block-id contract.
             instance_id (int): Target KV-cache instance.
             event_ipc_handle (bytes): IPC handle to the forward's CUDA event.
+            skip_layer_indices (list[int]): Registered KV-tensor indices that
+                SHIFTED matches are not scattered (nor re-RoPE'd) into. The
+                plugin passes the decoder layers below its CHECK layer: its
+                FULL_RECOMP phase rewrites those slots before anything reads
+                them, so leaving them alone lets the forward start while this
+                scatter is still in flight (the worker stream-waits the
+                returned event at the CHECK layer instead of host-blocking
+                before the forward). Non-shifted matches always land in every
+                layer. Empty = scatter everything.
 
         Returns:
             tuple[bytes, bool]: The scatter-complete event handle and whether
@@ -2656,6 +2760,10 @@ class BlendModule(InstanceLivenessTarget):
         # groups. Legacy fused layout: object group 0, every kernel group.
         read_groups, staged_kernel = self._cb_staged_groups(gpu_context)
         n_read = len(read_groups.gids)
+        # Per staged kernel group: leading layers a shifted match skips.
+        shifted_layer_lo = _cb_shifted_layer_lo(
+            gpu_context.kv_layer_groups_manager, staged_kernel, skip_layer_indices
+        )
 
         _retrieve_t0 = time.perf_counter()
 
@@ -3017,7 +3125,12 @@ class BlendModule(InstanceLivenessTarget):
                     # native ops, non-lazy objects, max_batch < 2, or size mismatch).
                     _stage_t = time.perf_counter()
                     native_flat = self._build_cb_retrieve_plan_flat(
-                        gpu_context, rope_state, cpu_block_tables, runs, max_batch
+                        gpu_context,
+                        rope_state,
+                        cpu_block_tables,
+                        runs,
+                        max_batch,
+                        shifted_layer_lo=shifted_layer_lo,
                     )
                     _stage_ms["plan"] = (time.perf_counter() - _stage_t) * 1000
                     if native_flat is not None:
@@ -3091,6 +3204,7 @@ class BlendModule(InstanceLivenessTarget):
                                 batch,
                                 rope_state.head_size,
                                 staged_kernel,
+                                shifted_layer_lo=shifted_layer_lo,
                             )
 
                     applied_now = {
@@ -3178,12 +3292,13 @@ class BlendModule(InstanceLivenessTarget):
         logger.info(
             "Retrieved pre-computed for %d match results into request %s "
             "paged blocks (scatter_ms=%.2f, non_shifted=%d shifted=%d, "
-            "stages_ms=%s)",
+            "shifted_layer_lo=%s, stages_ms=%s)",
             len(cb_match_result),
             key.request_id,
             _scatter_ms,
             n_non_shifted,
             n_shifted,
+            shifted_layer_lo,
             {k: round(v, 1) for k, v in _stage_ms.items()},
         )
         self._event_bus.publish_on_stream(

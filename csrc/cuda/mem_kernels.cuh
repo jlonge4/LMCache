@@ -21,6 +21,10 @@ constexpr int MAX_FUSED_TRANSFER_CHUNKS = 16;
 
 // Fused transfer: one launch, up to MAX_FUSED_TRANSFER_CHUNKS same-geometry
 // chunks; params ride in the kernel-arg buffer (no device upload).
+// layer_lo: first layer (of the chunk's [kv, num_layers, ...] layout) to
+// transfer; layers [0, layer_lo) are skipped on both sides. CacheBlend uses
+// it to leave the layers its FULL_RECOMP phase recomputes anyway untouched,
+// so the forward can start before the scatter lands.
 void multi_layer_kv_transfer_fused_ptr(
     const std::vector<uintptr_t>& key_values,
     const std::vector<uintptr_t>& slot_mappings, const std::vector<int>& n_toks,
@@ -29,7 +33,7 @@ void multi_layer_kv_transfer_fused_ptr(
     const int element_size, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size = 0,
-    const int head_size = 0);
+    const int head_size = 0, const int layer_lo = 0);
 
 // collapses to multi_layer_kv_transfer for MLA
 void multi_layer_kv_transfer_unilateral(

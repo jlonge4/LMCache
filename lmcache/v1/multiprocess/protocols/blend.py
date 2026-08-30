@@ -52,8 +52,13 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         ),
         # Retrieve pre-computed chunks into the request's paged blocks.
         # Payload: (key, cb_match_result, gpu_block_ids, instance_id,
-        #           event_ipc_handle).
+        #           event_ipc_handle, skip_layer_indices).
         # gpu_block_ids is per engine group (list[list[int]]).
+        # skip_layer_indices: registered KV-tensor indices (the REGISTER_KV_CACHE
+        # dict order) that SHIFTED matches are not scattered into -- the layers
+        # CacheBlend's FULL_RECOMP phase overwrites anyway. Non-shifted
+        # (prefix-class) matches always land in every layer. Empty = every
+        # layer, the pre-overlap behaviour.
         "CB_RETRIEVE_PRE_COMPUTED": ProtocolDefinition(
             payload_classes=[
                 IPCCacheServerKey,
@@ -61,6 +66,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 list[list[int]],
                 int,
                 bytes,
+                list[int],
             ],
             response_class=tuple[bytes, bool],
             handler_type=HandlerType.BLOCKING,

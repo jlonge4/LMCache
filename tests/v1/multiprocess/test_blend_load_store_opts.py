@@ -1045,13 +1045,16 @@ def test_flat_plan_tables_encode_every_work_item():
     assert dests[1] != dests[0]
     shared_ptr = gpu_context.get_temp_object_group_buffer(0, 0).data_ptr()
     assert shared_ptr not in dests, "staging must not target the shared pool"
-    # Rope rows: 2 shifted chunks x 2 groups.
-    assert ropes.shape == (4, 4)
+    # Rope rows: 2 shifted chunks x 2 groups; 5th column = layer_lo (0: no
+    # deferred scatter requested).
+    assert ropes.shape == (4, 5)
     assert sorted(set(ropes[:, 2].tolist())) == [100, 104]  # old_st values
+    assert ropes[:, 4].tolist() == [0] * 4
     # Scatter rows: 3 chunks x 2 groups, token offsets 0,4,8 repeated per group.
-    assert scatters.shape == (6, 4)
+    assert scatters.shape == (6, 5)
     assert scatters[:, 2].tolist() == [0, 0, 4, 4, 8, 8]
     assert scatters[:, 3].tolist() == [4] * 6
+    assert scatters[:, 4].tolist() == [0] * 6
     # Step CSR: 3 steps of 1 chunk; scatter ends = chunks x groups.
     assert step_offsets.shape == (3, 3)
     assert step_offsets[:, 0].tolist() == [1, 2, 3]
@@ -1357,3 +1360,151 @@ def test_classify_read_groups_recurrent_first_layout():
     assert read.attn_gid == 1
     # Read set ascending, recurrent excluded.
     assert read.gids == (1, 2)
+
+
+@native_retrieve_plan_required
+def test_flat_plan_layer_lo_marks_shifted_rows_only():
+    """``shifted_layer_lo`` (per staged group) lands in the 5th column of
+    every rope row and of the scatter rows of SHIFTED chunks; a prefix-class
+    chunk (old == cur) scatters every layer, so its rows carry 0."""
+    # Third Party
+    import numpy as np
+
+    eng, gpu_context, rope_state, obj_bytes = _build_plan_engine_and_context()
+
+    def pair(cur_st, cur_ed, old_st):
+        return (
+            SimpleNamespace(cur_st=cur_st, cur_ed=cur_ed, old_st=old_st),
+            (_lazy_memory_obj(obj_bytes, address=cur_st * 1000),),
+        )
+
+    # Chunks 0/1 shifted, chunk 2 prefix (old == cur).
+    runs = [[pair(0, 4, 100), pair(4, 8, 104), pair(8, 12, 8)]]
+    cpu_block_tables = [
+        (np.array([10, 11, 12], dtype=np.int64), 4),
+        (np.array([20, 21, 22], dtype=np.int64), 4),
+    ]
+
+    plan = eng._build_cb_retrieve_plan_flat(
+        gpu_context,
+        rope_state,
+        cpu_block_tables,
+        runs,
+        max_batch=2,
+        shifted_layer_lo=[1, 2],
+    )
+    assert plan is not None
+    _specs, (_staging, ropes, scatters, _steps), _keep = plan
+    # Rope rows are (chunk-major, group-minor) for the 2 shifted chunks.
+    assert ropes[:, 0].tolist() == [0, 1, 0, 1]
+    assert ropes[:, 4].tolist() == [1, 2, 1, 2]
+    # Scatter rows: shifted chunks carry the group's lo, the prefix chunk 0.
+    assert scatters[:, 0].tolist() == [0, 1, 0, 1, 0, 1]
+    assert scatters[:, 4].tolist() == [1, 2, 1, 2, 0, 0]
+
+    with pytest.raises(ValueError, match="staged kernel group"):
+        eng._build_cb_retrieve_plan_flat(
+            gpu_context,
+            rope_state,
+            cpu_block_tables,
+            runs,
+            max_batch=2,
+            shifted_layer_lo=[1],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Retrieve: skip_layer_indices -> per-kernel-group leading-layer counts
+# ---------------------------------------------------------------------------
+
+
+def _kgm(*layer_indices_per_group):
+    return SimpleNamespace(
+        kernel_groups=[
+            SimpleNamespace(layer_indices=list(li)) for li in layer_indices_per_group
+        ]
+    )
+
+
+def test_shifted_layer_lo_counts_leading_layers_per_group():
+    """HMA-style interleaving: registered layers 0,2,4 in group 0 and 1,3,5
+    in group 1. Skipping decoder layers {0, 1} (check_layer 2) is one
+    leading layer of each group; skipping {0, 2} is two of group 0, none of
+    group 1."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.blend import _cb_shifted_layer_lo
+
+    kgm = _kgm([0, 2, 4], [1, 3, 5])
+    assert _cb_shifted_layer_lo(kgm, [0, 1], [0, 1]) == [1, 1]
+    assert _cb_shifted_layer_lo(kgm, [0, 1], [0, 2]) == [2, 0]
+    assert _cb_shifted_layer_lo(kgm, [1, 0], [0]) == [0, 1]  # staged order
+    assert _cb_shifted_layer_lo(kgm, [0, 1], []) == [0, 0]
+    # Skipping a whole group is a valid (if odd) prefix.
+    assert _cb_shifted_layer_lo(kgm, [0, 1], [0, 2, 4]) == [3, 0]
+
+
+def test_shifted_layer_lo_rejects_non_leading_layers():
+    """A skip set that is not a leading prefix of a group's layer order is
+    not expressible to the fused scatter kernel: refuse loudly."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.blend import _cb_shifted_layer_lo
+
+    kgm = _kgm([0, 1, 2, 3])
+    with pytest.raises(ValueError, match="leading layers"):
+        _cb_shifted_layer_lo(kgm, [0], [1])
+    with pytest.raises(ValueError, match="leading layers"):
+        _cb_shifted_layer_lo(kgm, [0], [0, 2])
+
+
+def test_fallback_scatter_drops_leading_layers_of_shifted_slots():
+    """Python fallback path: a shifted slot with ``layer_lo`` scatters a
+    contiguous ``[:, lo:]`` view against the matching pointer slice; a
+    prefix-class slot in the same batch keeps every layer."""
+    # First Party
+    from lmcache.v1.multiprocess.modules import blend as blend_mod
+
+    eng, gpu_context, buffers = _build_scatter_engine_and_context(
+        num_groups=1, num_slots=2, spc=4, num_layers=3
+    )
+    gpu_context.get_kernel_group_kv_pointers.side_effect = lambda g: torch.arange(3)
+    shifted = SimpleNamespace(cur_st=0, cur_ed=4, old_st=100)
+    prefix = SimpleNamespace(cur_st=4, cur_ed=8, old_st=4)
+    batch = [(shifted, None), (prefix, None)]
+    resolved_groups = [(torch.tensor([10, 11], dtype=torch.long), 4)]
+
+    with patch.object(blend_mod, "device_ops") as ops:
+        eng._scatter_batch_to_paged(
+            gpu_context, resolved_groups, batch, 32, [0], shifted_layer_lo=[1]
+        )
+
+    calls = ops.multi_layer_kv_transfer.call_args_list
+    assert len(calls) == 2
+    kv0, ptrs0 = calls[0].args[0], calls[0].args[1]
+    assert kv0.shape == (2, 2, 4, 8)  # layers [1:3)
+    assert kv0.is_contiguous()
+    assert ptrs0.tolist() == [1, 2]
+    assert calls[0].args[2].tolist() == [40, 41, 42, 43]
+    # Prefix-class slot: untouched buffer identity, full pointer array.
+    assert calls[1].args[0] is buffers[(1, 0)]
+    assert calls[1].args[1].tolist() == [0, 1, 2]
+    assert calls[1].args[2].tolist() == [44, 45, 46, 47]
+
+
+def test_fallback_scatter_skips_slot_when_every_layer_is_skipped():
+    # First Party
+    from lmcache.v1.multiprocess.modules import blend as blend_mod
+
+    eng, gpu_context, buffers = _build_scatter_engine_and_context(
+        num_groups=1, num_slots=2, spc=4, num_layers=2
+    )
+    gpu_context.get_kernel_group_kv_pointers.side_effect = lambda g: torch.arange(2)
+    batch = [
+        (SimpleNamespace(cur_st=0, cur_ed=4, old_st=100), None),
+        (SimpleNamespace(cur_st=4, cur_ed=8, old_st=104), None),
+    ]
+    resolved_groups = [(torch.tensor([10, 11], dtype=torch.long), 4)]
+    with patch.object(blend_mod, "device_ops") as ops:
+        eng._scatter_batch_to_paged(
+            gpu_context, resolved_groups, batch, 32, [0], shifted_layer_lo=[2]
+        )
+    assert ops.multi_layer_kv_transfer.call_args_list == []

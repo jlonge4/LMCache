@@ -57,6 +57,10 @@ struct CBRopeVar {
   int slot_idx;
   int64_t old_st;
   int64_t cur_st;
+  // First layer of the slot to rotate; layers [0, layer_lo) are left as
+  // staged. Pairs with CBScatterVar::layer_lo (a layer that is not
+  // scattered need not be re-RoPE'd).
+  int layer_lo = 0;
 };
 
 // One per-token scatter launch: write `n_tok` tokens of tmp slot `slot_idx`
@@ -66,6 +70,10 @@ struct CBScatterVar {
   int slot_idx;
   int64_t slot_mapping_offset;
   int n_tok;
+  // First layer of the slot to write; layers [0, layer_lo) of the paged KV
+  // are left untouched. CacheBlend skips the layers its FULL_RECOMP phase
+  // recomputes so the forward can overlap the scatter (0 = every layer).
+  int layer_lo = 0;
 };
 
 // One batch of tmp slots: H2D staging, then re-RoPE, then scatter. The order

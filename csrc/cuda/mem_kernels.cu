@@ -412,9 +412,12 @@ __global__ void load_and_reshape_multi_layer_fused_kernel(
     const FusedTransferPack<scalar_t> pack,
     scalar_t** __restrict__ paged_buffer_ptrs, const int k_or_v_size,
     const int scalars_per_token, const int num_tokens, const int num_layers,
-    const int page_buffer_size, const int block_size, const int head_size) {
+    const int page_buffer_size, const int block_size, const int head_size,
+    const int layer_lo) {
   const int token_id = blockIdx.x;
-  const int layer_id = blockIdx.y;
+  // grid.y spans layers [layer_lo, num_layers); the chunk buffer keeps its
+  // full num_layers geometry, so only the layer index shifts.
+  const int layer_id = blockIdx.y + layer_lo;
   const int chunk_id = blockIdx.z / k_or_v_size;
   const int k_or_v = blockIdx.z % k_or_v_size;
   const int tid = threadIdx.x;
@@ -758,10 +761,16 @@ void multi_layer_kv_transfer_fused_templated(
     const int element_size, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size,
-    const int head_size) {
+    const int head_size, const int layer_lo) {
   const int n_chunks = static_cast<int>(key_values.size());
   TORCH_CHECK(n_chunks >= 1 && n_chunks <= MAX_FUSED_TRANSFER_CHUNKS,
               "fused transfer chunk count out of range: ", n_chunks);
+  TORCH_CHECK(layer_lo >= 0 && layer_lo <= num_layers,
+              "fused transfer layer_lo out of range: ", layer_lo,
+              " (num_layers ", num_layers, ")");
+  if (layer_lo == num_layers) {
+    return;  // every layer skipped: nothing to launch
+  }
   TORCH_CHECK(slot_mappings.size() == key_values.size() &&
                   n_toks.size() == key_values.size(),
               "fused transfer parameter vectors must be the same length");
@@ -794,18 +803,19 @@ void multi_layer_kv_transfer_fused_templated(
                                                                           : 2;
 
   T** page_buffer_ptrs = reinterpret_cast<T**>(page_buffer_ptrs_raw);
-  dim3 grid(max_tok, num_layers, k_or_v_size * n_chunks);
+  dim3 grid(max_tok, num_layers - layer_lo, k_or_v_size * n_chunks);
   dim3 block(std::min(num_xwords, 128));
 
   const at::cuda::OptionalCUDAGuard device_guard(paged_memory_device);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 #ifndef LAUNCH_FUSED_WITH_FORMAT
-  #define LAUNCH_FUSED_WITH_FORMAT(T_, DIR, FORMAT)                      \
-    lmc::load_and_reshape_multi_layer_fused_kernel<T_, DIR, FORMAT>      \
-        <<<grid, block, 0, stream>>>(                                    \
-            pack, page_buffer_ptrs, k_or_v_size, num_xwords, num_tokens, \
-            num_layers, page_buffer_size, block_size, head_size_xword);  \
+  #define LAUNCH_FUSED_WITH_FORMAT(T_, DIR, FORMAT)                       \
+    lmc::load_and_reshape_multi_layer_fused_kernel<T_, DIR, FORMAT>       \
+        <<<grid, block, 0, stream>>>(pack, page_buffer_ptrs, k_or_v_size, \
+                                     num_xwords, num_tokens, num_layers,  \
+                                     page_buffer_size, block_size,        \
+                                     head_size_xword, layer_lo);          \
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 #endif
 #ifndef FUSED_FORMAT_SWITCH
@@ -874,7 +884,7 @@ void multi_layer_kv_transfer_fused_ptr(
     const int element_size, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size,
-    const int head_size) {
+    const int head_size, const int layer_lo) {
   int copy_size = num_origin_elements * element_size;
 #ifndef LAUNCH_FUSED_TRANSFER
   #define LAUNCH_FUSED_TRANSFER(type)                                         \
@@ -883,7 +893,7 @@ void multi_layer_kv_transfer_fused_ptr(
           key_values, slot_mappings, n_toks, page_buffer_ptrs, num_layers,    \
           layout_num_tokens, num_origin_elements, element_size,               \
           paged_memory_device, page_buffer_size, direction, engine_kv_format, \
-          block_size, head_size);                                             \
+          block_size, head_size, layer_lo);                                   \
     } while (0)
 #endif
   if (copy_size % 8 == 0) {
