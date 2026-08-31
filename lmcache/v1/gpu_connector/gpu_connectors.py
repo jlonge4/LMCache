@@ -266,22 +266,15 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             layout_hints=layout_hints,
         )
 
-    def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
+    def _initialize_pointers(
+        self, kv_caches: List[torch.Tensor]
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         self.device = kv_caches[0].device
-        assert self.device.type == "cuda", "The device should be CUDA."
-        idx = self.device.index
-        if idx in self.kv_cache_pointers_on_gpu:
-            return self.kv_cache_pointers_on_gpu[idx]
+        device_type = str(self.device).split(":")[0]
 
         self.engine_kv_format, kv_caches = normalize_kv_and_discover_format(
             kv_caches, EngineType.VLLM, layout_hints=self.layout_hints
         )
-
-        self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in kv_caches]
-        self.kv_cache_pointers_on_gpu[idx] = torch.empty(
-            self.num_layers, dtype=torch.int64, device=self.device
-        )
-        self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
         self.num_blocks = get_num_blocks(kv_caches, self.engine_kv_format)
         self.block_size = get_block_size(kv_caches, self.engine_kv_format)
         self.page_buffer_size = self.num_blocks * self.block_size
@@ -292,6 +285,20 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             )
             or 0
         )
+
+        if device_type not in ("cuda", "xpu", "musa"):
+            self._kv_cache_list = kv_caches
+            return kv_caches
+
+        idx = self.device.index
+        if idx in self.kv_cache_pointers_on_gpu:
+            return self.kv_cache_pointers_on_gpu[idx]
+
+        self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in kv_caches]
+        self.kv_cache_pointers_on_gpu[idx] = torch.empty(
+            self.num_layers, dtype=torch.int64, device=self.device
+        )
+        self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
 
         return self.kv_cache_pointers_on_gpu[idx]
 
@@ -460,7 +467,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         use_gpu: bool = False,
         layout_hints: Optional[LayoutHints] = None,
     ):
-        assert device.type == "cuda", "The device should be CUDA."
+        assert device.type in ("cuda", "neuron", "xpu", "musa", "hpu"), f"Unsupported device type: {device.type}"
         self.metadata = metadata
         self.device = device
         self.use_mla = metadata.use_mla
@@ -555,16 +562,23 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 for shape, dtype in zip(tmp_buf_shapes, tmp_buf_dtypes, strict=True)
             ]
 
+        device_type = str(self.device).split(":")[0]
         self.group_kv_cache_pointers_on_gpu = []
+        self._group_kv_cache_tensor_lists: list[list[torch.Tensor]] = []
         for group in klg_manager.kernel_groups:
-            ptrs = get_group_data_ptrs(
-                self.kvcaches, self.engine_kv_format, group.layer_indices
-            )
-            cpu = torch.empty(len(ptrs), dtype=torch.int64, device="cpu")
-            cpu.numpy()[:] = ptrs
-            gpu = torch.empty(len(ptrs), dtype=torch.int64, device=self.device)
-            gpu.copy_(cpu)
-            self.group_kv_cache_pointers_on_gpu.append(gpu)
+            if device_type not in ("cuda", "xpu", "musa"):
+                layer_tensors = [self.kvcaches[i] for i in group.layer_indices]
+                self._group_kv_cache_tensor_lists.append(layer_tensors)
+                self.group_kv_cache_pointers_on_gpu.append(layer_tensors)
+            else:
+                ptrs = get_group_data_ptrs(
+                    self.kvcaches, self.engine_kv_format, group.layer_indices
+                )
+                cpu = torch.empty(len(ptrs), dtype=torch.int64, device="cpu")
+                cpu.numpy()[:] = ptrs
+                gpu = torch.empty(len(ptrs), dtype=torch.int64, device=self.device)
+                gpu.copy_(cpu)
+                self.group_kv_cache_pointers_on_gpu.append(gpu)
 
         self.init = True
         logger.info("init kv cache pointers success in VLLMPagedMemGPUConnectorV3")
@@ -1541,7 +1555,7 @@ class SGLangGPUConnector(GPUConnectorInterface):
         self.kv_cache_pointers.numpy()[:] = ptrs
 
         device = get_device(kv_caches)
-        assert device.type == "cuda", "The device should be CUDA."
+        assert device.type in ("cuda", "neuron", "xpu", "musa", "hpu"), f"Unsupported device type: {device.type}"
         idx = device.index
         if idx not in self.kv_cache_pointers_on_gpu:
             self.kv_cache_pointers_on_gpu[idx] = torch.empty(
