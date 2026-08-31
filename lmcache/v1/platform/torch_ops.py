@@ -704,7 +704,7 @@ def multi_layer_kv_transfer(
                     gathered = paged_cpu[bi_cpu, :, :, bo_cpu, :].permute(
                         1, 0, 2, 3
                     )
-                flat = gathered.contiguous().reshape(2, -1, hidden_size)
+                flat = gathered.contiguous().reshape(2, -1, hidden_size).clone()
                 key_value[:, layer_id, valid_mask_kv, :] = flat
         else:
             # Paged layout : [2, page_buffer_size, hidden_size]
