@@ -684,7 +684,7 @@ def multi_layer_kv_transfer(
                 # LMCache -> paged: reshape flat hidden to [NH, HS], scatter
                 lmc_valid = key_value[:, layer_id, valid_mask_kv, :]
                 # lmc_valid: [2, num_valid, hidden_size]
-                src = lmc_valid.view(2, -1, num_heads, head_size).to(
+                src = lmc_valid.contiguous().view(2, -1, num_heads, head_size).to(
                     paged_memory_device
                 )
                 # src: [2, num_valid, NH, HS]
@@ -706,7 +706,7 @@ def multi_layer_kv_transfer(
                         block_indices, :, :, block_offsets, :
                     ].permute(1, 0, 2, 3)
                     # gathered: [2, num_valid, NH, HS]
-                flat = gathered.reshape(2, -1, hidden_size).to(
+                flat = gathered.contiguous().reshape(2, -1, hidden_size).to(
                     kv_device, non_blocking=False
                 )
                 key_value[:, layer_id, valid_mask_kv, :] = flat
