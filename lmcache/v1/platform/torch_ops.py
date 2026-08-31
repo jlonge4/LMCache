@@ -680,35 +680,31 @@ def multi_layer_kv_transfer(
             is_two_first = int(engine_kv_format) == int(
                 EngineKVFormat.NL_X_TWO_NB_NH_BS_HS
             )
+            # For non-CUDA devices (e.g. Neuron), fancy indexing on device
+            # tensors may fail. Move to CPU for the reshape, then back.
+            paged_cpu = paged_tensor.cpu()
             if int(direction) == int(TransferDirection.H2D):
-                # LMCache -> paged: reshape flat hidden to [NH, HS], scatter
                 lmc_valid = key_value[:, layer_id, valid_mask_kv, :]
-                # lmc_valid: [2, num_valid, hidden_size]
-                src = lmc_valid.contiguous().view(2, -1, num_heads, head_size).to(
-                    paged_memory_device
+                src = lmc_valid.contiguous().view(
+                    2, -1, num_heads, head_size
                 )
-                # src: [2, num_valid, NH, HS]
                 if is_two_first:
-                    paged_tensor[:, block_indices, :, block_offsets, :] = src
+                    paged_cpu[:, block_indices.cpu(), :, block_offsets.cpu(), :] = src
                 else:
-                    paged_tensor[block_indices, :, :, block_offsets, :] = (
+                    paged_cpu[block_indices.cpu(), :, :, block_offsets.cpu(), :] = (
                         src.permute(1, 0, 2, 3)
                     )
+                paged_tensor.copy_(paged_cpu)
             else:
-                # Paged -> LMCache: gather, flatten [NH, HS] -> hidden_size
+                bi_cpu = block_indices.cpu()
+                bo_cpu = block_offsets.cpu()
                 if is_two_first:
-                    gathered = paged_tensor[
-                        :, block_indices, :, block_offsets, :
-                    ]
-                    # gathered: [2, num_valid, NH, HS]
+                    gathered = paged_cpu[:, bi_cpu, :, bo_cpu, :]
                 else:
-                    gathered = paged_tensor[
-                        block_indices, :, :, block_offsets, :
-                    ].permute(1, 0, 2, 3)
-                    # gathered: [2, num_valid, NH, HS]
-                flat = gathered.contiguous().reshape(2, -1, hidden_size).to(
-                    kv_device, non_blocking=False
-                )
+                    gathered = paged_cpu[bi_cpu, :, :, bo_cpu, :].permute(
+                        1, 0, 2, 3
+                    )
+                flat = gathered.contiguous().reshape(2, -1, hidden_size)
                 key_value[:, layer_id, valid_mask_kv, :] = flat
         else:
             # Paged layout : [2, page_buffer_size, hidden_size]
