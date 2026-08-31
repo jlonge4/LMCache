@@ -719,7 +719,9 @@ def multi_layer_kv_transfer(
                         g = paged_cpu[bi_cpu, kv_idx, :, bo_cpu, :]
                         parts.append(g.reshape(-1, hidden_size))
                     flat = torch.stack(parts, dim=0)
-                key_value[:, layer_id, valid_mask_kv, :] = flat.clone()
+                flat_c = flat.clone()
+                for kv_idx2 in range(2):
+                    key_value[kv_idx2, layer_id, valid_mask_kv, :] = flat_c[kv_idx2]
         else:
             # Paged layout : [2, page_buffer_size, hidden_size]
             # key_value layout: [2, num_layers, num_tokens, hidden_size]
