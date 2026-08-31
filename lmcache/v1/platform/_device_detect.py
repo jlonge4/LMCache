@@ -241,6 +241,12 @@ def _patch_missing_device_module_methods(torch_module: Any, spec: Any) -> None:
         torch_module.set_device = lambda *a, **kw: None
     if not hasattr(torch_module, "device_count"):
         torch_module.device_count = lambda: 1
+    if not hasattr(torch_module, "Stream"):
+        from lmcache.v1.gpu_connector.gpu_connectors import _NoOpStream
+        torch_module.Stream = _NoOpStream
+    if not hasattr(torch_module, "current_stream"):
+        from lmcache.v1.gpu_connector.gpu_connectors import _NoOpStream
+        torch_module.current_stream = lambda: _NoOpStream()
 
 
 def _detect_device() -> "tuple[Any, str, str | None]":
