@@ -15,8 +15,8 @@ from lmcache.v1.metadata import LMCacheMetadata
 # subset of accelerators. Each entry is ``(attr_name, human_label,
 # supported_devices)``; the human label is what appears in the error message.
 _DEVICE_SCOPED_VLLM_BOOL_FEATURES: tuple[tuple[str, str, frozenset[str]], ...] = (
-    ("enable_blending", "config.enable_blending", frozenset({"cuda", "xpu"})),
-    ("use_gpu_connector_v3", "config.use_gpu_connector_v3", frozenset({"cuda", "xpu"})),
+    ("enable_blending", "config.enable_blending", frozenset({"cuda", "xpu", "neuron"})),
+    ("use_gpu_connector_v3", "config.use_gpu_connector_v3", frozenset({"cuda", "xpu", "neuron"})),
 )
 
 
@@ -170,7 +170,7 @@ def CreateGPUConnector(
         torch_dev.set_device(local_worker_id)
         device = torch.device(f"{torch_device_type}:{local_worker_id}")
 
-        if torch_device_type == "cuda":
+        if torch_device_type in ("cuda", "neuron"):
             # First Party
             from lmcache.v1.gpu_connector.gpu_connectors import (
                 VLLMBufferLayerwiseGPUConnector,
