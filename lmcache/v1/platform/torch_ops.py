@@ -683,29 +683,43 @@ def multi_layer_kv_transfer(
             # For non-CUDA devices (e.g. Neuron), fancy indexing on device
             # tensors may fail. Move to CPU for the reshape, then back.
             paged_cpu = paged_tensor.cpu()
+            bi_cpu = block_indices.cpu()
+            bo_cpu = block_offsets.cpu()
             if int(direction) == int(TransferDirection.H2D):
                 lmc_valid = key_value[:, layer_id, valid_mask_kv, :]
+                # lmc_valid: [2, num_valid, hidden_size]
                 src = lmc_valid.contiguous().view(
                     2, -1, num_heads, head_size
                 )
+                # src: [2, num_valid, NH, HS]
                 if is_two_first:
-                    paged_cpu[:, block_indices.cpu(), :, block_offsets.cpu(), :] = src
+                    # paged: [2, NB, NH, BS, HS]
+                    # Advanced indexing on dims 1,3 puts indexed dim first:
+                    # need [num_valid, NH, HS] per KV, write via loop
+                    for kv_idx in range(2):
+                        paged_cpu[kv_idx, bi_cpu, :, bo_cpu, :] = src[kv_idx]
                 else:
-                    paged_cpu[block_indices.cpu(), :, :, block_offsets.cpu(), :] = (
-                        src.permute(1, 0, 2, 3)
-                    )
+                    # paged: [NB, 2, NH, BS, HS]
+                    for kv_idx in range(2):
+                        paged_cpu[bi_cpu, kv_idx, :, bo_cpu, :] = src[kv_idx]
                 paged_tensor.copy_(paged_cpu)
             else:
-                bi_cpu = block_indices.cpu()
-                bo_cpu = block_offsets.cpu()
                 if is_two_first:
-                    gathered = paged_cpu[:, bi_cpu, :, bo_cpu, :]
+                    # paged: [2, NB, NH, BS, HS]
+                    parts = []
+                    for kv_idx in range(2):
+                        g = paged_cpu[kv_idx, bi_cpu, :, bo_cpu, :]
+                        # g: [num_valid, NH, HS]
+                        parts.append(g.reshape(-1, hidden_size))
+                    flat = torch.stack(parts, dim=0)
+                    # flat: [2, num_valid, hidden_size]
                 else:
-                    gathered = paged_cpu[bi_cpu, :, :, bo_cpu, :].permute(
-                        1, 0, 2, 3
-                    )
-                flat = gathered.contiguous().reshape(2, -1, hidden_size).clone()
-                key_value[:, layer_id, valid_mask_kv, :] = flat
+                    parts = []
+                    for kv_idx in range(2):
+                        g = paged_cpu[bi_cpu, kv_idx, :, bo_cpu, :]
+                        parts.append(g.reshape(-1, hidden_size))
+                    flat = torch.stack(parts, dim=0)
+                key_value[:, layer_id, valid_mask_kv, :] = flat.clone()
         else:
             # Paged layout : [2, page_buffer_size, hidden_size]
             # key_value layout: [2, num_layers, num_tokens, hidden_size]
