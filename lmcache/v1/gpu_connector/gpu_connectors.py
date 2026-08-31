@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 import abc
 

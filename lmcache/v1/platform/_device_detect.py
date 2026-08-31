@@ -240,7 +240,13 @@ def _patch_missing_device_module_methods(torch_module: Any, spec: Any) -> None:
     if not hasattr(torch_module, "set_device"):
         torch_module.set_device = lambda *a, **kw: None
     if not hasattr(torch_module, "device_count"):
-        torch_module.device_count = lambda: 1
+        import os
+        neuron_devices = os.environ.get("NEURON_VISIBLE_DEVICES", "")
+        if neuron_devices:
+            count = len(neuron_devices.split(","))
+        else:
+            count = 1
+        torch_module.device_count = lambda: count
     if not hasattr(torch_module, "Stream") or not hasattr(torch_module, "current_stream"):
 
         class _NoOpStream:
