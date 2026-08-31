@@ -226,6 +226,23 @@ def _resolve_device_type_candidates(
     return None
 
 
+def _patch_missing_device_module_methods(torch_module: Any, spec: Any) -> None:
+    """Add no-op stubs for methods that non-CUDA backends may lack.
+
+    Some backends (e.g. Neuron's ``libtorch_neuronx_lite``) do not expose
+    ``set_device`` or ``device_count`` on their torch device module.
+    LMCache calls these in several places; patching no-ops avoids degraded
+    mode on platforms where device pinning is handled externally (e.g. via
+    ``NEURON_VISIBLE_DEVICES``).
+    """
+    if torch_module is None:
+        return
+    if not hasattr(torch_module, "set_device"):
+        torch_module.set_device = lambda *a, **kw: None
+    if not hasattr(torch_module, "device_count"):
+        torch_module.device_count = lambda: 1
+
+
 def _detect_device() -> "tuple[Any, str, str | None]":
     """Detect the available accelerator via the device registry.
 
@@ -244,6 +261,7 @@ def _detect_device() -> "tuple[Any, str, str | None]":
     env_backend_name = _get_env_choice(DEVICE_BACKEND_ENV_VAR)
     if env_backend_name is not None:
         torch_module, spec = _resolve_explicit_backend(torch, env_backend_name)
+        _patch_missing_device_module_methods(torch_module, spec)
         return torch_module, spec.device_type, spec.backend_name
 
     env_device_type = _get_env_choice("DEVICE_TYPE")
@@ -251,6 +269,7 @@ def _detect_device() -> "tuple[Any, str, str | None]":
         resolved = _resolve_device_type_candidates(torch, env_device_type)
         if resolved is not None:
             torch_module, spec = resolved
+            _patch_missing_device_module_methods(torch_module, spec)
             return torch_module, spec.device_type, spec.backend_name
         logger.warning(
             "DEVICE_TYPE=%r is not available or not registered, "
@@ -262,6 +281,7 @@ def _detect_device() -> "tuple[Any, str, str | None]":
         resolved = _resolve_device_type_candidates(torch, device_type)
         if resolved is not None:
             torch_module, spec = resolved
+            _patch_missing_device_module_methods(torch_module, spec)
             return torch_module, spec.device_type, spec.backend_name
 
     # No accelerator found -- fall back to CPU stub
