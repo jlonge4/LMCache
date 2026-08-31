@@ -575,17 +575,10 @@ def multi_layer_kv_transfer(
             f"Expected torch.Tensor or list, but got {type(key_value_ptrs).__name__}"
         )
 
-    # TODO: Implement head_size support for HND layouts (NL_X_TWO_NB_NH_BS_HS,
-    # NL_X_NB_TWO_NH_BS_HS) as next step.
-    if int(engine_kv_format) in (
+    is_hnd_split_kv = int(engine_kv_format) in (
         int(EngineKVFormat.NL_X_TWO_NB_NH_BS_HS),
         int(EngineKVFormat.NL_X_NB_TWO_NH_BS_HS),
-    ):
-        raise NotImplementedError(
-            "HND layouts (NL_X_TWO_NB_NH_BS_HS, NL_X_NB_TWO_NH_BS_HS) "
-            "are not supported in the non-CUDA fallback. "
-            "head_size parameter is required but not implemented in this path."
-        )
+    )
     # 1. Filter out invalid slots.
     #    valid_mask_kv:  on key_value.device, used to index key_value
     #    valid_slots:    on paged_memory_device, used to index paged_tensor
@@ -612,10 +605,15 @@ def multi_layer_kv_transfer(
     num_layers = key_value.size(1)
     hidden_size = key_value.size(3)
 
-    # For the flash_infer interleaved layout, pre-compute block-level indices.
-    if is_flash_infer:
+    # For block-indexed layouts, pre-compute block-level indices.
+    if is_flash_infer or is_hnd_split_kv:
         block_indices = valid_slots // block_size
         block_offsets = valid_slots % block_size
+
+    # For HND layouts, derive num_heads from hidden_size and head_size.
+    if is_hnd_split_kv:
+        assert head_size > 0, "head_size is required for HND layouts"
+        num_heads = hidden_size // head_size
 
     # Determine the physical shape of the underlying paged tensor
     # (used when wrapping a raw pointer).
@@ -626,6 +624,12 @@ def multi_layer_kv_transfer(
     elif is_flash_infer:
         num_blocks = page_buffer_size // block_size
         layer_shape = (num_blocks, 2, block_size, hidden_size)
+    elif is_hnd_split_kv:
+        num_blocks = page_buffer_size // block_size
+        if int(engine_kv_format) == int(EngineKVFormat.NL_X_TWO_NB_NH_BS_HS):
+            layer_shape = (2, num_blocks, num_heads, block_size, head_size)
+        else:
+            layer_shape = (num_blocks, 2, num_heads, block_size, head_size)
     else:
         layer_shape = (2, page_buffer_size, hidden_size)
 
@@ -669,6 +673,43 @@ def multi_layer_kv_transfer(
                 key_value[:, layer_id, valid_mask_kv, :] = gathered.to(
                     kv_device, non_blocking=False
                 ).transpose(0, 1)
+        elif is_hnd_split_kv:
+            # NL_X_TWO_NB_NH_BS_HS: [2, NB, NH, BS, HS]
+            # NL_X_NB_TWO_NH_BS_HS: [NB, 2, NH, BS, HS]
+            # key_value layout:      [2, NL, num_tokens, hidden_size]
+            is_two_first = int(engine_kv_format) == int(
+                EngineKVFormat.NL_X_TWO_NB_NH_BS_HS
+            )
+            if int(direction) == int(TransferDirection.H2D):
+                # LMCache -> paged: reshape flat hidden to [NH, HS], scatter
+                lmc_valid = key_value[:, layer_id, valid_mask_kv, :]
+                # lmc_valid: [2, num_valid, hidden_size]
+                src = lmc_valid.view(2, -1, num_heads, head_size).to(
+                    paged_memory_device
+                )
+                # src: [2, num_valid, NH, HS]
+                if is_two_first:
+                    paged_tensor[:, block_indices, :, block_offsets, :] = src
+                else:
+                    paged_tensor[block_indices, :, :, block_offsets, :] = (
+                        src.permute(1, 0, 2, 3)
+                    )
+            else:
+                # Paged -> LMCache: gather, flatten [NH, HS] -> hidden_size
+                if is_two_first:
+                    gathered = paged_tensor[
+                        :, block_indices, :, block_offsets, :
+                    ]
+                    # gathered: [2, num_valid, NH, HS]
+                else:
+                    gathered = paged_tensor[
+                        block_indices, :, :, block_offsets, :
+                    ].permute(1, 0, 2, 3)
+                    # gathered: [2, num_valid, NH, HS]
+                flat = gathered.reshape(2, -1, hidden_size).to(
+                    kv_device, non_blocking=False
+                )
+                key_value[:, layer_id, valid_mask_kv, :] = flat
         else:
             # Paged layout : [2, page_buffer_size, hidden_size]
             # key_value layout: [2, num_layers, num_tokens, hidden_size]
