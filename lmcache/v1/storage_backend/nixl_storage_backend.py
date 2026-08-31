@@ -1079,7 +1079,7 @@ class NixlStaticStorageBackend(NixlStorageBackend):
             nixl_config.path,
             nixl_config.use_direct_io,
             nixl_config.path_sharding,
-            f"cuda:{metadata.worker_id}",
+            get_correct_device(config.nixl_buffer_device, metadata.worker_id),
         )
         assert self.pool is not None
 

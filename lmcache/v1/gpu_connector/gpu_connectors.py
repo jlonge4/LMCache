@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from contextlib import contextmanager, nullcontext
 from typing import List, Optional, Tuple, Union
 import abc
 
@@ -8,6 +9,28 @@ import torch
 
 # First Party
 from lmcache import device_ops
+
+
+def _create_device_stream(device: torch.device) -> object:
+    """Create a stream for the given device, or a no-op stub for unsupported devices."""
+    device_type = str(device).split(":")[0] if device is not None else "cpu"
+    if device_type == "cuda":
+        return torch.cuda.Stream()
+    return _NoOpStream()
+
+
+def _device_stream_context(stream: object):
+    """Return a context manager that routes ops to the given stream."""
+    if isinstance(stream, torch.cuda.Stream):
+        return torch.cuda.stream(stream)
+    return nullcontext()
+
+
+class _NoOpStream:
+    """Synchronous fallback for non-CUDA devices."""
+
+    def synchronize(self) -> None:
+        pass
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
@@ -201,8 +224,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 shape, dtype=kwargs["dtype"], device=kwargs["device"]
             )
 
-        self.store_stream = torch.cuda.Stream()
-        self.load_stream = torch.cuda.Stream()
+        self.store_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
+        self.load_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
 
     @classmethod
     def from_metadata(
@@ -371,7 +394,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
-        with torch.cuda.stream(self.store_stream):
+        with _device_stream_context(self.store_stream):
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 device_ops.multi_layer_kv_transfer(
                     memory_obj.tensor,
@@ -414,7 +437,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        with torch.cuda.stream(self.load_stream):
+        with _device_stream_context(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
         self.load_stream.synchronize()
@@ -450,8 +473,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.group_kv_cache_pointers_on_gpu: Optional[list[torch.Tensor]] = None
         self.group_tmp_buffer: Optional[list[torch.Tensor]] = None
 
-        self.store_stream = torch.cuda.Stream()
-        self.load_stream = torch.cuda.Stream()
+        self.store_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
+        self.load_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
 
     @classmethod
     def from_metadata(
@@ -596,7 +619,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         assert self.kvcaches[0].device == self.device
         self._initialize_kv_cache_pointers()
         assert self.group_kv_cache_pointers_on_gpu is not None
-        with torch.cuda.stream(self.store_stream):
+        with _device_stream_context(self.store_stream):
             if not self.use_gpu or end - start != self.chunk_size:
                 for i, kv_cache_pointer in enumerate(
                     self.group_kv_cache_pointers_on_gpu
@@ -648,7 +671,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        with torch.cuda.stream(self.load_stream):
+        with _device_stream_context(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
         self.load_stream.synchronize()
@@ -693,8 +716,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.dtype = kwargs["dtype"]
         self.device = kwargs["device"]
 
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
+        self.load_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
+        self.store_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
 
         self.buffer_mapping: dict[int, MemoryObj] = {}
 
@@ -895,7 +918,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
             if layer_id > 0 and layer_id <= self.num_layers:
                 # NOTE: wait until both compute and load streams are done
-                torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
                 # ping-pong the buffers
                 compute_gpu_buffer_obj, load_gpu_buffer_obj = (
@@ -924,7 +948,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 memory_objs_layer = yield
 
                 # memobj -> gpu_buffer
-                with torch.cuda.stream(self.load_stream):
+                with _device_stream_context(self.load_stream):
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
@@ -1034,13 +1058,14 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         )
         assert tmp_gpu_buffer_obj.tensor is not None
 
-        current_stream = torch.cuda.current_stream()
+        current_stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
-            with torch.cuda.stream(self.store_stream):
-                self.store_stream.wait_stream(current_stream)
+            with _device_stream_context(self.store_stream):
+                if current_stream is not None:
+                    self.store_stream.wait_stream(current_stream)
                 device_ops.single_layer_kv_transfer(
                     tmp_gpu_buffer_obj.tensor,
                     self.kvcaches[layer_id],
@@ -1115,8 +1140,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # All sizes are in bytes
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
 
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
+        self.load_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
+        self.store_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
 
@@ -1264,17 +1289,18 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             assert tmp_gpu_buffer_obj.tensor is not None
 
         offset = starts[0]
-        current_stream = torch.cuda.current_stream()
+        current_stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
             if sync:
-                current_stream.wait_stream(self.load_stream)
+                if current_stream is not None:
+                    current_stream.wait_stream(self.load_stream)
             if layer_id > 0:
                 logger.debug("Finished loading layer %s", layer_id - 1)
 
             # memobj -> gpu_buffer -> kvcaches
-            with torch.cuda.stream(self.load_stream):
+            with _device_stream_context(self.load_stream):
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
@@ -1315,7 +1341,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         yield
 
         # synchronize the last layer
-        if sync:
+        if sync and current_stream is not None:
             current_stream.wait_stream(self.load_stream)
 
         # free the buffer memory
@@ -1396,13 +1422,14 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             assert tmp_gpu_buffer_obj.tensor is not None
 
         offset = starts[0]
-        current_stream = torch.cuda.current_stream()
+        current_stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
-            with torch.cuda.stream(self.store_stream):
-                self.store_stream.wait_stream(current_stream)
+            with _device_stream_context(self.store_stream):
+                if current_stream is not None:
+                    self.store_stream.wait_stream(current_stream)
                 if self.use_gpu:
                     device_ops.single_layer_kv_transfer(
                         tmp_gpu_buffer_obj.tensor,
@@ -1641,7 +1668,8 @@ class SGLangGPUConnector(GPUConnectorInterface):
             # Force a synchronize if the target buffer is NOT CUDA device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
-            torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
@@ -2004,8 +2032,8 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
         self.dtype = dtype
         self.device = device
         self._batch_size = _TRTLLM_KERNEL_BATCH_SIZE
-        self.load_stream = torch.cuda.Stream(device=device)
-        self.store_stream = torch.cuda.Stream(device=device)
+        self.load_stream = _create_device_stream(device)
+        self.store_stream = _create_device_stream(device)
 
         self.kv_cache_tensor: Optional[torch.Tensor] = None
         self.paged_buffer_ptrs: Optional[torch.Tensor] = None
@@ -2126,11 +2154,11 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
         tensor_ptr: int,
         block_ids: List[int],
         direction: "lmcache_native.TransferDirection",
-        stream: torch.cuda.Stream,
+        stream: object,
     ) -> None:
         if self.shape_desc is None or self._kv_format is None:
             raise RuntimeError("register_kv_caches must be called before transfer")
-        with torch.cuda.stream(stream):
+        with _device_stream_context(stream):
             block_ids_gpu = self._stage_block_ids(block_ids)
             device_ops.multi_layer_block_kv_transfer(
                 self.paged_buffer_ptrs,
@@ -2176,7 +2204,7 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
         starts: List[int],
         block_ids: List[int],
         direction: "lmcache_native.TransferDirection",
-        stream: torch.cuda.Stream,
+        stream: object,
     ) -> None:
         if self.shape_desc is None or self._kv_format is None:
             raise RuntimeError("register_kv_caches must be called before transfer")
@@ -2188,7 +2216,7 @@ class TRTLLMGPUConnector(GPUConnectorInterface):
             if chunk_blocks is not None:
                 valid.append((memory_obj, chunk_blocks))
 
-        with torch.cuda.stream(stream):
+        with _device_stream_context(stream):
             for i in range(0, len(valid), self._batch_size):
                 batch = valid[i : i + self._batch_size]
                 all_block_ids: List[int] = []
