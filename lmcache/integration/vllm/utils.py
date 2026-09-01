@@ -412,7 +412,10 @@ def calculate_local_rank_and_world_size(vllm_config: "VllmConfig") -> Tuple[int,
     parallel_config = vllm_config.parallel_config
     global_rank = parallel_config.rank
     global_world_size = parallel_config.world_size
-    num_gpus = torch_dev.device_count()
+    try:
+        num_gpus = torch_dev.device_count()
+    except AttributeError:
+        num_gpus = parallel_config.world_size
     if global_world_size <= num_gpus:
         # single node case
         return parallel_config.rank, parallel_config.world_size
