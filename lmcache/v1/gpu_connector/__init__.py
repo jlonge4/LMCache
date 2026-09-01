@@ -158,14 +158,6 @@ def CreateGPUConnector(
     elif engine == EngineType.VLLM:
         _validate_vllm_device_features(config)
 
-        # First Party
-        from lmcache.v1.gpu_connector.gpu_connectors import (
-            VLLMBufferLayerwiseGPUConnector,
-            VLLMPagedMemGPUConnectorV2,
-            VLLMPagedMemGPUConnectorV3,
-            VLLMPagedMemLayerwiseGPUConnector,
-        )
-
         local_worker_id = metadata.local_worker_id
         torch_dev.set_device(local_worker_id)
         device = torch.device(f"{torch_device_type}:{local_worker_id}")
@@ -178,7 +170,6 @@ def CreateGPUConnector(
         )
 
         if torch_device_type in ("cuda", "neuron"):
-            print(f"[NEURON-TRACE] gpu_connector/__init__.py / CreateGPUConnector: dispatching for device={torch_device_type}, neuron_nixl_staging={enable_neuron_nixl_staging}", flush=True)
             # First Party
             from lmcache.v1.gpu_connector.gpu_connectors import (
                 VLLMBufferLayerwiseGPUConnector,

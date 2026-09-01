@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 import os
+import time
 import uuid
 
 # Third Party
@@ -94,7 +95,6 @@ class NeuronNixlBlockStager:
     """Stage selected KV blocks from Neuron memory into CPU paged tensors."""
 
     def __init__(self, backends: Optional[Sequence[str] | str] = None):
-        print(f"[NEURON-TRACE] neuron_nixl_staging.py / NeuronNixlBlockStager.__init__: backends={backends}", flush=True)
         self.backends = _parse_backends(backends)
         self._agent: Any = None
         self._src_wrapper: Any = None
@@ -240,7 +240,12 @@ class NeuronNixlBlockStager:
                 indices,
             )
             state = agent.transfer(xfer_handle)
+            deadline = time.monotonic() + 30.0
             while state not in ("DONE", "ERR"):
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        "NIXL READ timed out after 30s for staged KV block copy"
+                    )
                 state = agent.check_xfer_state(xfer_handle)
             if state != "DONE":
                 raise RuntimeError(
@@ -313,8 +318,14 @@ class NeuronNixlBlockStager:
                 indices,
                 b"lmcache-neuron-staging",
             )
+            import time
             state = dst_wrapper.transfer(xfer_handle)
+            deadline = time.monotonic() + 30.0
             while state not in ("DONE", "ERR"):
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        "NIXL READ timed out after 30s for staged KV block copy"
+                    )
                 state = dst_wrapper.check_xfer_state(xfer_handle)
             if state != "DONE":
                 raise RuntimeError(

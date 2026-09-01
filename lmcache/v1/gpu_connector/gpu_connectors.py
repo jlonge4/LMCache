@@ -12,12 +12,11 @@ import torch
 from lmcache import device_ops
 
 
-def _create_device_stream(device: torch.device) -> object:
+def _create_device_stream(device: torch.device | None) -> object:
     """Create a stream for the given device, or a no-op stub for unsupported devices."""
     device_type = str(device).split(":")[0] if device is not None else "cpu"
     if device_type == "cuda":
         return torch.cuda.Stream()
-    print(f"[NEURON-TRACE] gpu_connectors.py / _create_device_stream: using _NoOpStream for device={device}", flush=True)
     return _NoOpStream()
 
 
@@ -33,13 +32,17 @@ class _NoOpStream:
 
     def synchronize(self) -> None:
         pass
+
+    def wait_stream(self, other: object) -> None:
+        pass
+
+
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.kv_format.contiguity import (
     attempt_permute_to_contiguous_view,
 )
-from lmcache.v1.gpu_connector.neuron_nixl_staging import NeuronNixlBlockStager
 from lmcache.v1.gpu_connector.utils import (
     DiscoverableKVCache,
     LayoutHints,
@@ -217,8 +220,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             )
             or {}
         )
-        self._neuron_nixl_stager: Optional[NeuronNixlBlockStager] = None
+        self._neuron_nixl_stager = None
         if self.enable_neuron_nixl_staging:
+            from lmcache.v1.gpu_connector.neuron_nixl_staging import NeuronNixlBlockStager
             self._neuron_nixl_stager = NeuronNixlBlockStager(
                 kwargs.get("neuron_nixl_backends")
             )
@@ -235,8 +239,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 shape, dtype=kwargs["dtype"], device=kwargs["device"]
             )
 
-        self.store_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
-        self.load_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
+        self.store_stream = _create_device_stream(kwargs.get("device"))
+        self.load_stream = _create_device_stream(kwargs.get("device"))
 
     @classmethod
     def from_metadata(
@@ -512,16 +516,17 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.layout_hints: LayoutHints = layout_hints or {}
         self.kvcaches: Optional[List[torch.Tensor]] = None
         self.enable_neuron_nixl_staging = enable_neuron_nixl_staging
-        self._neuron_nixl_stager: Optional[NeuronNixlBlockStager] = None
+        self._neuron_nixl_stager = None
         if self.enable_neuron_nixl_staging:
+            from lmcache.v1.gpu_connector.neuron_nixl_staging import NeuronNixlBlockStager
             self._neuron_nixl_stager = NeuronNixlBlockStager(neuron_nixl_backends)
 
         self.init = False
         self.group_kv_cache_pointers_on_gpu: Optional[list[torch.Tensor]] = None
         self.group_tmp_buffer: Optional[list[torch.Tensor]] = None
 
-        self.store_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
-        self.load_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
+        self.store_stream = _create_device_stream(self.device)
+        self.load_stream = _create_device_stream(self.device)
 
     @classmethod
     def from_metadata(
@@ -800,8 +805,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.dtype = kwargs["dtype"]
         self.device = kwargs["device"]
 
-        self.load_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
-        self.store_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
+        self.load_stream = _create_device_stream(self.device)
+        self.store_stream = _create_device_stream(self.device)
 
         self.buffer_mapping: dict[int, MemoryObj] = {}
 
@@ -1224,8 +1229,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         # All sizes are in bytes
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
 
-        self.load_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
-        self.store_stream = _create_device_stream(self.device if hasattr(self, 'device') else None)
+        self.load_stream = _create_device_stream(self.device)
+        self.store_stream = _create_device_stream(self.device)
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
 

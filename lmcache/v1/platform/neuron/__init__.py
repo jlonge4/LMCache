@@ -44,7 +44,6 @@ class NeuronDeviceSpec(DeviceSpec):
             import torch
 
             if hasattr(torch, "neuron") and torch.neuron.is_available():  # type: ignore[attr-defined]
-                print("[NEURON-TRACE] neuron/__init__.py / NeuronDeviceSpec.is_available: native torch.neuron detected", flush=True)
                 return True
             try:
                 import torch_neuronx  # noqa: F401
