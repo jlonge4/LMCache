@@ -376,6 +376,22 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
+        if (
+            self._neuron_nixl_stager is not None
+            and isinstance(kv_cache_pointers, list)
+            and str(self.kvcaches[0].device).split(":")[0] == "neuron"
+        ):
+            self._neuron_nixl_stager.transfer_from_key_value(
+                key_value=memory_obj.tensor,
+                layer_tensors=kv_cache_pointers,
+                slot_mapping=slot_mapping[start:end],
+                engine_kv_format=self.engine_kv_format,
+                block_size=self.block_size,
+                head_size=self.head_size,
+                skip_prefix_n_tokens=skip_prefix_n_tokens,
+            )
+            return
+
         device_ops.multi_layer_kv_transfer(
             memory_obj.tensor,
             kv_cache_pointers,
@@ -664,6 +680,25 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         # block lmcache is transferring back
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
+
+        if (
+            self._neuron_nixl_stager is not None
+            and str(self.kvcaches[0].device).split(":")[0] == "neuron"
+        ):
+            for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
+                assert isinstance(kv_cache_pointer, list)
+                memory_obj_tensor = memory_obj.get_tensor(i)
+                assert memory_obj_tensor is not None
+                self._neuron_nixl_stager.transfer_from_key_value(
+                    key_value=memory_obj_tensor,
+                    layer_tensors=kv_cache_pointer,
+                    slot_mapping=slot_mapping[start:end],
+                    engine_kv_format=self.engine_kv_format,
+                    block_size=self.block_size,
+                    head_size=self.head_size,
+                    skip_prefix_n_tokens=skip_prefix_n_tokens,
+                )
+            return
 
         for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
             memory_obj_tensor = memory_obj.get_tensor(i)

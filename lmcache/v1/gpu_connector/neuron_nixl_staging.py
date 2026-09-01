@@ -152,6 +152,188 @@ class NeuronNixlBlockStager:
             head_size=head_size,
         )
 
+    def transfer_from_key_value(
+        self,
+        key_value: torch.Tensor,
+        layer_tensors: list[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        engine_kv_format: "lmcache_native.EngineKVFormat",
+        block_size: int,
+        head_size: int,
+        skip_prefix_n_tokens: int = 0,
+    ) -> None:
+        """Scatter key_value (CPU) into device paged KV via NIXL WRITE.
+
+        Mirrors transfer_into_key_value but in the H2D direction:
+        CPU key_value → compact CPU staging tensors → NIXL WRITE to device.
+        """
+        if key_value.device.type != "cpu":
+            raise ValueError("Neuron NIXL staging requires a CPU source tensor")
+        if not layer_tensors:
+            return
+        if slot_mapping.numel() == 0:
+            return
+
+        selected_blocks, compact_slot_mapping = self._compact_slot_mapping(
+            slot_mapping, block_size
+        )
+        if not selected_blocks:
+            return
+
+        compact_num_blocks = len(selected_blocks)
+        staged_layers = [
+            self._alloc_stage_tensor(
+                layer_tensor, compact_num_blocks, block_size, engine_kv_format
+            )
+            for layer_tensor in layer_tensors
+        ]
+
+        compact_page_buffer_size = compact_num_blocks * block_size
+        device_ops.multi_layer_kv_transfer(
+            key_value,
+            staged_layers,
+            compact_slot_mapping,
+            torch.device("cpu"),
+            compact_page_buffer_size,
+            lmcache_native.TransferDirection.H2D,
+            engine_kv_format,
+            block_size=block_size,
+            head_size=head_size,
+            skip_prefix_n_tokens=skip_prefix_n_tokens,
+        )
+
+        for staged_layer, device_layer in zip(
+            staged_layers, layer_tensors, strict=True
+        ):
+            self._write_layer_blocks(
+                src_layer=staged_layer,
+                dst_layer=device_layer,
+                selected_blocks=selected_blocks,
+                engine_kv_format=engine_kv_format,
+                block_size=block_size,
+            )
+
+    def _write_layer_blocks(
+        self,
+        src_layer: torch.Tensor,
+        dst_layer: torch.Tensor,
+        selected_blocks: list[int],
+        engine_kv_format: "lmcache_native.EngineKVFormat",
+        block_size: int,
+    ) -> None:
+        """NIXL WRITE: CPU staging tensor → selected blocks on device."""
+        self._write_layer_blocks_via_vllm_wrapper(
+            src_layer=src_layer,
+            dst_layer=dst_layer,
+            selected_blocks=selected_blocks,
+            engine_kv_format=engine_kv_format,
+            block_size=block_size,
+        )
+
+    def _write_layer_blocks_via_vllm_wrapper(
+        self,
+        src_layer: torch.Tensor,
+        dst_layer: torch.Tensor,
+        selected_blocks: list[int],
+        engine_kv_format: "lmcache_native.EngineKVFormat",
+        block_size: int,
+    ) -> None:
+        """NIXL WRITE via vLLM NixlWrapper: CPU → device blocks."""
+        src_wrapper = self._ensure_dst_wrapper()
+        dst_wrapper = self._ensure_src_wrapper()
+        src_mem_type = "DRAM"
+        dst_mem_type = "VRAM"
+
+        src_nbytes = _view_nbytes(src_layer)
+        dst_nbytes = _view_nbytes(dst_layer)
+        src_reg_descs = src_wrapper.get_reg_descs(
+            [(int(src_layer.data_ptr()), src_nbytes, 0, "")],
+            src_mem_type,
+        )
+        dst_reg_descs = dst_wrapper.get_reg_descs(
+            [(int(dst_layer.data_ptr()), dst_nbytes, _tensor_device_id(dst_layer), "")],
+            dst_mem_type,
+        )
+        src_wrapper.register_memory(src_reg_descs, backends=self.backends)
+        dst_wrapper.register_memory(dst_reg_descs, backends=self.backends)
+
+        src_regions = self._regions_for_tensor(
+            src_layer,
+            list(range(len(selected_blocks))),
+            engine_kv_format,
+            block_size,
+        )
+        dst_regions = self._regions_for_tensor(
+            dst_layer, selected_blocks, engine_kv_format, block_size
+        )
+
+        src_descs = dst_wrapper.get_xfer_descs(
+            [(r.addr, r.size_bytes, r.device_id) for r in src_regions],
+            src_mem_type,
+        )
+        dst_descs = dst_wrapper.get_xfer_descs(
+            [(r.addr, r.size_bytes, r.device_id) for r in dst_regions],
+            dst_mem_type,
+        )
+        remote_agent_name = None
+        src_handle = None
+        dst_handle = None
+        remote_agent_name = dst_wrapper.add_remote_agent(
+            src_wrapper.get_agent_metadata()
+        )
+        src_handle = dst_wrapper.prep_xfer_dlist(remote_agent_name, src_descs)
+        dst_handle = dst_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", dst_descs)
+        xfer_handle = None
+        try:
+            indices = list(range(len(src_regions)))
+            xfer_handle = dst_wrapper.make_prepped_xfer(
+                "WRITE",
+                src_handle,
+                indices,
+                dst_handle,
+                indices,
+                b"lmcache-neuron-h2d-staging",
+            )
+            state = dst_wrapper.transfer(xfer_handle)
+            deadline = time.monotonic() + 30.0
+            while state not in ("DONE", "ERR"):
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        "NIXL WRITE timed out after 30s for staged KV block scatter"
+                    )
+                state = dst_wrapper.check_xfer_state(xfer_handle)
+            if state != "DONE":
+                raise RuntimeError(
+                    f"NIXL WRITE failed for staged KV block scatter: state={state}"
+                )
+        except Exception:
+            logger.exception(
+                "Neuron NIXL H2D staging failed: selected_blocks=%s src_nbytes=%d "
+                "dst_nbytes=%d src_regions=%s dst_regions=%s",
+                selected_blocks,
+                src_nbytes,
+                dst_nbytes,
+                [(r.addr, r.size_bytes, r.device_id) for r in src_regions],
+                [(r.addr, r.size_bytes, r.device_id) for r in dst_regions],
+            )
+            raise
+        finally:
+            if xfer_handle is not None:
+                dst_wrapper.release_xfer_handle(xfer_handle)
+            if src_handle is not None:
+                dst_wrapper.release_dlist_handle(src_handle)
+            if dst_handle is not None:
+                dst_wrapper.release_dlist_handle(dst_handle)
+            if (
+                remote_agent_name is not None
+                and hasattr(dst_wrapper, "remove_remote_agent")
+            ):
+                dst_wrapper.remove_remote_agent(remote_agent_name)
+            if hasattr(src_wrapper, "deregister_memory"):
+                src_wrapper.deregister_memory(src_reg_descs)
+            if hasattr(dst_wrapper, "deregister_memory"):
+                dst_wrapper.deregister_memory(dst_reg_descs)
+
     def _ensure_agent(self):
         if self._agent is not None:
             return self._agent
