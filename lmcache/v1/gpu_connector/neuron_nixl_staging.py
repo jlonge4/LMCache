@@ -94,7 +94,7 @@ class NeuronNixlBlockStager:
     """Stage selected KV blocks from Neuron memory into CPU paged tensors."""
 
     def __init__(self, backends: Optional[Sequence[str] | str] = None):
-        print(f"[NEURON-TRACE] neuron_nixl_staging.py / NeuronNixlBlockStager.__init__: backends={backends}")
+        print(f"[NEURON-TRACE] neuron_nixl_staging.py / NeuronNixlBlockStager.__init__: backends={backends}", flush=True)
         self.backends = _parse_backends(backends)
         self._agent: Any = None
         self._src_wrapper: Any = None

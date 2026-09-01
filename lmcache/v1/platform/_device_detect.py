@@ -237,7 +237,7 @@ def _patch_missing_device_module_methods(torch_module: Any, spec: Any) -> None:
     """
     if torch_module is None:
         return
-    print(f"[NEURON-TRACE] _device_detect.py / _patch_missing_device_module_methods: patching {torch_module}")
+    print(f"[NEURON-TRACE] _device_detect.py / _patch_missing_device_module_methods: patching {torch_module}", flush=True)
     if not hasattr(torch_module, "set_device"):
         torch_module.set_device = lambda *a, **kw: None
     if not hasattr(torch_module, "device_count"):

@@ -626,7 +626,7 @@ def multi_layer_kv_transfer(
         num_blocks = page_buffer_size // block_size
         layer_shape = (num_blocks, 2, block_size, hidden_size)
     elif is_hnd_split_kv:
-        print(f"[NEURON-TRACE] torch_ops.py / multi_layer_kv_transfer: HND layout path, format={engine_kv_format}")
+        print(f"[NEURON-TRACE] torch_ops.py / multi_layer_kv_transfer: HND layout path, format={engine_kv_format}", flush=True)
         num_blocks = page_buffer_size // block_size
         if int(engine_kv_format) == int(EngineKVFormat.NL_X_TWO_NB_NH_BS_HS):
             layer_shape = (2, num_blocks, num_heads, block_size, head_size)

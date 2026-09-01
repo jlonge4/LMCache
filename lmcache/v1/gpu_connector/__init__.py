@@ -178,7 +178,7 @@ def CreateGPUConnector(
         )
 
         if torch_device_type in ("cuda", "neuron"):
-            print(f"[NEURON-TRACE] gpu_connector/__init__.py / CreateGPUConnector: dispatching for device={torch_device_type}, neuron_nixl_staging={enable_neuron_nixl_staging}")
+            print(f"[NEURON-TRACE] gpu_connector/__init__.py / CreateGPUConnector: dispatching for device={torch_device_type}, neuron_nixl_staging={enable_neuron_nixl_staging}", flush=True)
             # First Party
             from lmcache.v1.gpu_connector.gpu_connectors import (
                 VLLMBufferLayerwiseGPUConnector,
