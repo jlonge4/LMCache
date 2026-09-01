@@ -596,7 +596,8 @@ def multi_layer_kv_transfer(
     if not valid_mask_kv.any():
         return
 
-    valid_slots = slots_kv[valid_mask_kv].to(paged_memory_device)
+    token_indices = valid_mask_kv.nonzero(as_tuple=False).flatten()
+    valid_slots = slots_kv.index_select(0, token_indices).to(paged_memory_device)
 
     # 2. Determine architecture variant and tensor dimensions.
     is_mla = _format_spec(engine_kv_format).is_mla
@@ -686,7 +687,12 @@ def multi_layer_kv_transfer(
             bi_cpu = block_indices.cpu()
             bo_cpu = block_offsets.cpu()
             if int(direction) == int(TransferDirection.H2D):
-                lmc_valid = key_value[:, layer_id, valid_mask_kv, :]
+                parts = []
+                for kv_idx in range(2):
+                    parts.append(
+                        key_value[kv_idx, layer_id].index_select(0, token_indices)
+                    )
+                lmc_valid = torch.stack(parts, dim=0)
                 # lmc_valid: [2, num_valid, hidden_size]
                 src = lmc_valid.contiguous().view(
                     2, -1, num_heads, head_size
@@ -719,9 +725,11 @@ def multi_layer_kv_transfer(
                         g = paged_cpu[bi_cpu, kv_idx, :, bo_cpu, :]
                         parts.append(g.reshape(-1, hidden_size))
                     flat = torch.stack(parts, dim=0)
-                flat_c = flat.clone()
+                flat_c = flat.clone().to(kv_device, non_blocking=False)
                 for kv_idx2 in range(2):
-                    key_value[kv_idx2, layer_id, valid_mask_kv, :] = flat_c[kv_idx2]
+                    key_value[kv_idx2, layer_id].index_copy_(
+                        0, token_indices, flat_c[kv_idx2]
+                    )
         else:
             # Paged layout : [2, page_buffer_size, hidden_size]
             # key_value layout: [2, num_layers, num_tokens, hidden_size]

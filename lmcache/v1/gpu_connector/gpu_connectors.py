@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
+from collections.abc import Sequence
 from typing import List, Optional, Tuple, Union
 import abc
 
@@ -37,6 +38,7 @@ from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.kv_format.contiguity import (
     attempt_permute_to_contiguous_view,
 )
+from lmcache.v1.gpu_connector.neuron_nixl_staging import NeuronNixlBlockStager
 from lmcache.v1.gpu_connector.utils import (
     DiscoverableKVCache,
     LayoutHints,
@@ -205,12 +207,20 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         self.gpu_buffer: Optional[torch.Tensor] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        self.enable_neuron_nixl_staging = kwargs.get(
+            "enable_neuron_nixl_staging", False
+        )
         self.layout_hints: LayoutHints = (
             kwargs.get(  # type: ignore[assignment]
                 "layout_hints"
             )
             or {}
         )
+        self._neuron_nixl_stager: Optional[NeuronNixlBlockStager] = None
+        if self.enable_neuron_nixl_staging:
+            self._neuron_nixl_stager = NeuronNixlBlockStager(
+                kwargs.get("neuron_nixl_backends")
+            )
         if use_gpu:
             assert "chunk_size" in kwargs, (
                 "chunk_size should be provided to create a GPU buffer."
@@ -234,6 +244,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
         layout_hints: Optional[LayoutHints] = None,
+        enable_neuron_nixl_staging: bool = False,
+        neuron_nixl_backends: Optional[Sequence[str] | str] = None,
     ) -> "VLLMPagedMemGPUConnectorV2":
         """Create a connector from LMCacheMetadata.
 
@@ -264,6 +276,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             device=device,
             use_mla=metadata.use_mla,
             layout_hints=layout_hints,
+            enable_neuron_nixl_staging=enable_neuron_nixl_staging,
+            neuron_nixl_backends=neuron_nixl_backends,
         )
 
     def _initialize_pointers(
@@ -401,6 +415,23 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
+        if (
+            self._neuron_nixl_stager is not None
+            and isinstance(kv_cache_pointers, list)
+            and str(self.kvcaches[0].device).split(":")[0] == "neuron"
+        ):
+            self._neuron_nixl_stager.transfer_into_key_value(
+                key_value=memory_obj.tensor,
+                layer_tensors=kv_cache_pointers,
+                slot_mapping=slot_mapping[start:end],
+                engine_kv_format=self.engine_kv_format,
+                block_size=self.block_size,
+                head_size=self.head_size,
+            )
+            if self.use_mla:
+                memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+            return
+
         with _device_stream_context(self.store_stream):
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 device_ops.multi_layer_kv_transfer(
@@ -466,8 +497,12 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         device: torch.device,
         use_gpu: bool = False,
         layout_hints: Optional[LayoutHints] = None,
+        enable_neuron_nixl_staging: bool = False,
+        neuron_nixl_backends: Optional[Sequence[str] | str] = None,
     ):
-        assert device.type in ("cuda", "neuron", "xpu", "musa", "hpu"), f"Unsupported device type: {device.type}"
+        assert device.type in ("cuda", "neuron", "xpu", "musa", "hpu"), (
+            f"Unsupported device type: {device.type}"
+        )
         self.metadata = metadata
         self.device = device
         self.use_mla = metadata.use_mla
@@ -475,6 +510,10 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.use_gpu = use_gpu
         self.layout_hints: LayoutHints = layout_hints or {}
         self.kvcaches: Optional[List[torch.Tensor]] = None
+        self.enable_neuron_nixl_staging = enable_neuron_nixl_staging
+        self._neuron_nixl_stager: Optional[NeuronNixlBlockStager] = None
+        if self.enable_neuron_nixl_staging:
+            self._neuron_nixl_stager = NeuronNixlBlockStager(neuron_nixl_backends)
 
         self.init = False
         self.group_kv_cache_pointers_on_gpu: Optional[list[torch.Tensor]] = None
@@ -490,9 +529,18 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
         layout_hints: Optional[LayoutHints] = None,
+        enable_neuron_nixl_staging: bool = False,
+        neuron_nixl_backends: Optional[Sequence[str] | str] = None,
     ) -> "VLLMPagedMemGPUConnectorV3":
         assert device is not None
-        return cls(metadata, device, use_gpu, layout_hints=layout_hints)
+        return cls(
+            metadata,
+            device,
+            use_gpu,
+            layout_hints=layout_hints,
+            enable_neuron_nixl_staging=enable_neuron_nixl_staging,
+            neuron_nixl_backends=neuron_nixl_backends,
+        )
 
     def _initialize_kv_cache_pointers(self):
         """Discover KV-cache layout, build the layer-groups manager, and
@@ -633,6 +681,27 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         assert self.kvcaches[0].device == self.device
         self._initialize_kv_cache_pointers()
         assert self.group_kv_cache_pointers_on_gpu is not None
+
+        if (
+            self._neuron_nixl_stager is not None
+            and str(self.kvcaches[0].device).split(":")[0] == "neuron"
+        ):
+            for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
+                assert isinstance(kv_cache_pointer, list)
+                memory_obj_tensor = memory_obj.get_tensor(i)
+                assert memory_obj_tensor is not None
+                self._neuron_nixl_stager.transfer_into_key_value(
+                    key_value=memory_obj_tensor,
+                    layer_tensors=kv_cache_pointer,
+                    slot_mapping=slot_mapping[start:end],
+                    engine_kv_format=self.engine_kv_format,
+                    block_size=self.block_size,
+                    head_size=self.head_size,
+                )
+            if self.use_mla:
+                memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+            return
+
         with _device_stream_context(self.store_stream):
             if not self.use_gpu or end - start != self.chunk_size:
                 for i, kv_cache_pointer in enumerate(
