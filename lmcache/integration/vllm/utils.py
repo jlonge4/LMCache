@@ -415,6 +415,7 @@ def calculate_local_rank_and_world_size(vllm_config: "VllmConfig") -> Tuple[int,
     try:
         num_gpus = torch_dev.device_count()
     except AttributeError:
+        print("[NEURON-TRACE] vllm/utils.py / calculate_local_rank_and_world_size: device_count fallback to world_size")
         num_gpus = parallel_config.world_size
     if global_world_size <= num_gpus:
         # single node case

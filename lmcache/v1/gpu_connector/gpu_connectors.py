@@ -17,6 +17,7 @@ def _create_device_stream(device: torch.device) -> object:
     device_type = str(device).split(":")[0] if device is not None else "cpu"
     if device_type == "cuda":
         return torch.cuda.Stream()
+    print(f"[NEURON-TRACE] gpu_connectors.py / _create_device_stream: using _NoOpStream for device={device}")
     return _NoOpStream()
 
 
