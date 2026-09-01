@@ -376,6 +376,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
+        import time as _time
+        _t0 = _time.perf_counter()
         device_ops.multi_layer_kv_transfer(
             memory_obj.tensor,
             kv_cache_pointers,
@@ -389,6 +391,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             block_stride_elems=self.block_stride_elems,
             skip_prefix_n_tokens=skip_prefix_n_tokens,
         )
+        logger.info("[PERF] H2D torch copy: %.2fms tokens=%d", (_time.perf_counter()-_t0)*1000, end-start)
 
     @_lmcache_nvtx_annotate
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
