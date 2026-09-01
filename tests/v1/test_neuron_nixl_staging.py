@@ -56,6 +56,79 @@ class FakeNixlAgent:
         self.deregistered.append(reg_descs)
 
 
+class FakeNixlWrapper:
+    def __init__(self, name):
+        self.name = name
+        self.reg_descs = []
+        self.registered = []
+        self.xfer_descs = []
+        self.remote_agents = []
+        self.prepped = []
+        self.xfers = []
+        self.released_xfers = []
+        self.released_dlists = []
+        self.removed_agents = []
+        self.deregistered = []
+
+    def get_reg_descs(self, reg_list, mem_type=None):
+        descs = ("reg_descs", len(self.reg_descs), mem_type, tuple(reg_list))
+        self.reg_descs.append(descs)
+        return descs
+
+    def register_memory(self, descs, backends=None):
+        self.registered.append((descs, tuple(backends or [])))
+        return ("registered", len(self.registered))
+
+    def get_xfer_descs(self, descs, mem_type=None):
+        tagged = ("xfer_descs", len(self.xfer_descs), mem_type, tuple(descs))
+        self.xfer_descs.append(tagged)
+        return tagged
+
+    def get_agent_metadata(self):
+        return b"agent-bytes"
+
+    def add_remote_agent(self, metadata):
+        self.remote_agents.append(metadata)
+        return "remote-agent"
+
+    def remove_remote_agent(self, name):
+        self.removed_agents.append(name)
+
+    def prep_xfer_dlist(self, name, descs):
+        handle = ("prep", len(self.prepped), name)
+        self.prepped.append((name, descs, handle))
+        return handle
+
+    def make_prepped_xfer(
+        self, direction, local_handle, local_ids, remote_handle, remote_ids, notif
+    ):
+        handle = (
+            direction,
+            local_handle,
+            tuple(local_ids),
+            remote_handle,
+            tuple(remote_ids),
+            notif,
+        )
+        self.xfers.append(handle)
+        return handle
+
+    def transfer(self, handle):
+        return "DONE"
+
+    def check_xfer_state(self, handle):
+        return "DONE"
+
+    def release_xfer_handle(self, handle):
+        self.released_xfers.append(handle)
+
+    def release_dlist_handle(self, handle):
+        self.released_dlists.append(handle)
+
+    def deregister_memory(self, descs):
+        self.deregistered.append(descs)
+
+
 def test_compact_slot_mapping_remaps_blocks_and_preserves_invalid_slots():
     stager = staging_mod.NeuronNixlBlockStager(backends=["LIBFABRIC"])
     slots = torch.tensor([-1, 4, 5, 12, 13], dtype=torch.long)
@@ -153,3 +226,46 @@ def test_transfer_into_key_value_uses_compact_slot_mapping_and_cpu_staging(monke
     assert len(fake_agent.transfers) == 1
     assert len(fake_agent.released) == 1
     assert len(fake_agent.deregistered) == 2
+
+
+def test_vllm_wrapper_copy_uses_two_agent_remote_source_handle(monkeypatch):
+    created_wrappers = []
+
+    monkeypatch.setattr(
+        staging_mod,
+        "_load_vllm_nixl_wrapper",
+        lambda: (
+            lambda name, _cfg: created_wrappers.append(FakeNixlWrapper(name))
+            or created_wrappers[-1],
+            lambda **kwargs: kwargs,
+        ),
+    )
+
+    stager = staging_mod.NeuronNixlBlockStager(backends=["LIBFABRIC"])
+    src = torch.empty((2, 4, 3, 2, 2), dtype=torch.float32)
+    dst = torch.empty((2, 2, 3, 2, 2), dtype=torch.float32)
+
+    stager._copy_layer_blocks_via_vllm_wrapper(
+        src_layer=src,
+        dst_layer=dst,
+        selected_blocks=[1, 3],
+        engine_kv_format=lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS,
+        block_size=2,
+    )
+
+    assert len(created_wrappers) == 2
+    src_wrapper, dst_wrapper = created_wrappers
+    assert src_wrapper.remote_agents == []
+    assert dst_wrapper.remote_agents == [b"agent-bytes"]
+    assert dst_wrapper.prepped[0][0] == "remote-agent"
+    assert dst_wrapper.prepped[1][0] == "NIXL_INIT_AGENT"
+    xfer = dst_wrapper.xfers[0]
+    assert xfer[0] == "READ"
+    assert xfer[2] == (0, 1, 2, 3)
+    assert xfer[4] == (0, 1, 2, 3)
+    assert xfer[5] == b"lmcache-neuron-staging"
+    assert len(dst_wrapper.released_xfers) == 1
+    assert len(dst_wrapper.released_dlists) == 2
+    assert dst_wrapper.removed_agents == ["remote-agent"]
+    assert len(src_wrapper.deregistered) == 1
+    assert len(dst_wrapper.deregistered) == 1

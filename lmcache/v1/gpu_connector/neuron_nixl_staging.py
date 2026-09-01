@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 import os
+import uuid
 
 # Third Party
 import torch
@@ -28,6 +29,12 @@ def _load_nixl_api():
     from nixl._api import nixl_agent, nixl_agent_config
 
     return nixl_agent, nixl_agent_config
+
+
+def _load_vllm_nixl_wrapper():
+    from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
+
+    return NixlWrapper, nixl_agent_config
 
 
 def _parse_backends(backends: Optional[Sequence[str] | str]) -> list[str]:
@@ -89,6 +96,8 @@ class NeuronNixlBlockStager:
     def __init__(self, backends: Optional[Sequence[str] | str] = None):
         self.backends = _parse_backends(backends)
         self._agent: Any = None
+        self._src_wrapper: Any = None
+        self._dst_wrapper: Any = None
 
     def transfer_into_key_value(
         self,
@@ -152,6 +161,21 @@ class NeuronNixlBlockStager:
         )
         return self._agent
 
+    def _create_wrapper(self):
+        NixlWrapper, nixl_agent_config = _load_vllm_nixl_wrapper()
+        config = nixl_agent_config(backends=self.backends)
+        return NixlWrapper(str(uuid.uuid4()), config)
+
+    def _ensure_src_wrapper(self):
+        if self._src_wrapper is None:
+            self._src_wrapper = self._create_wrapper()
+        return self._src_wrapper
+
+    def _ensure_dst_wrapper(self):
+        if self._dst_wrapper is None:
+            self._dst_wrapper = self._create_wrapper()
+        return self._dst_wrapper
+
     def _copy_layer_blocks(
         self,
         src_layer: torch.Tensor,
@@ -160,6 +184,17 @@ class NeuronNixlBlockStager:
         engine_kv_format: "lmcache_native.EngineKVFormat",
         block_size: int,
     ) -> None:
+        device_type = str(src_layer.device).split(":")[0]
+        if device_type == "neuron":
+            self._copy_layer_blocks_via_vllm_wrapper(
+                src_layer=src_layer,
+                dst_layer=dst_layer,
+                selected_blocks=selected_blocks,
+                engine_kv_format=engine_kv_format,
+                block_size=block_size,
+            )
+            return
+
         agent = self._ensure_agent()
         src_mem_type = "VRAM"
         dst_mem_type = "DRAM"
@@ -215,6 +250,102 @@ class NeuronNixlBlockStager:
                 agent.release_xfer_handle(xfer_handle)
             agent.deregister_memory(src_reg)
             agent.deregister_memory(dst_reg)
+
+    def _copy_layer_blocks_via_vllm_wrapper(
+        self,
+        src_layer: torch.Tensor,
+        dst_layer: torch.Tensor,
+        selected_blocks: list[int],
+        engine_kv_format: "lmcache_native.EngineKVFormat",
+        block_size: int,
+    ) -> None:
+        src_wrapper = self._ensure_src_wrapper()
+        dst_wrapper = self._ensure_dst_wrapper()
+        src_mem_type = "VRAM"
+        dst_mem_type = "DRAM"
+
+        src_nbytes = _view_nbytes(src_layer)
+        dst_nbytes = _view_nbytes(dst_layer)
+        src_reg_descs = src_wrapper.get_reg_descs(
+            [(int(src_layer.data_ptr()), src_nbytes, _tensor_device_id(src_layer), "")],
+            src_mem_type,
+        )
+        dst_reg_descs = dst_wrapper.get_reg_descs(
+            [(int(dst_layer.data_ptr()), dst_nbytes, 0, "")],
+            dst_mem_type,
+        )
+        src_wrapper.register_memory(src_reg_descs, backends=self.backends)
+        dst_wrapper.register_memory(dst_reg_descs, backends=self.backends)
+
+        src_regions = self._regions_for_tensor(
+            src_layer, selected_blocks, engine_kv_format, block_size
+        )
+        dst_regions = self._regions_for_tensor(
+            dst_layer,
+            list(range(len(selected_blocks))),
+            engine_kv_format,
+            block_size,
+        )
+
+        src_descs = dst_wrapper.get_xfer_descs(
+            [(r.addr, r.size_bytes, r.device_id) for r in src_regions],
+            src_mem_type,
+        )
+        dst_descs = dst_wrapper.get_xfer_descs(
+            [(r.addr, r.size_bytes, r.device_id) for r in dst_regions],
+            dst_mem_type,
+        )
+        remote_agent_name = None
+        src_handle = None
+        dst_handle = None
+        remote_agent_name = dst_wrapper.add_remote_agent(src_wrapper.get_agent_metadata())
+        src_handle = dst_wrapper.prep_xfer_dlist(remote_agent_name, src_descs)
+        dst_handle = dst_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", dst_descs)
+        xfer_handle = None
+        try:
+            indices = list(range(len(src_regions)))
+            xfer_handle = dst_wrapper.make_prepped_xfer(
+                "READ",
+                dst_handle,
+                indices,
+                src_handle,
+                indices,
+                b"lmcache-neuron-staging",
+            )
+            state = dst_wrapper.transfer(xfer_handle)
+            while state not in ("DONE", "ERR"):
+                state = dst_wrapper.check_xfer_state(xfer_handle)
+            if state != "DONE":
+                raise RuntimeError(
+                    f"NIXL READ failed for staged KV block copy: state={state}"
+                )
+        except Exception:
+            logger.exception(
+                "Neuron NIXL staging failed: selected_blocks=%s src_nbytes=%d "
+                "dst_nbytes=%d src_regions=%s dst_regions=%s",
+                selected_blocks,
+                src_nbytes,
+                dst_nbytes,
+                [(r.addr, r.size_bytes, r.device_id) for r in src_regions],
+                [(r.addr, r.size_bytes, r.device_id) for r in dst_regions],
+            )
+            raise
+        finally:
+            if xfer_handle is not None:
+                dst_wrapper.release_xfer_handle(xfer_handle)
+            if src_handle is not None:
+                dst_wrapper.release_dlist_handle(src_handle)
+            if dst_handle is not None:
+                dst_wrapper.release_dlist_handle(dst_handle)
+            if (
+                remote_agent_name is not None
+                and hasattr(dst_wrapper, "remove_remote_agent")
+            ):
+                dst_wrapper.remove_remote_agent(remote_agent_name)
+            if hasattr(src_wrapper, "deregister_memory"):
+                src_wrapper.deregister_memory(src_reg_descs)
+            if hasattr(dst_wrapper, "deregister_memory"):
+                dst_wrapper.deregister_memory(dst_reg_descs)
 
     def _compact_slot_mapping(
         self, slot_mapping: torch.Tensor, block_size: int
