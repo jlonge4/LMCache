@@ -130,14 +130,13 @@ class NeuronNixlBlockStager:
             for layer_tensor in layer_tensors
         ]
 
-        for src_layer, dst_layer in zip(layer_tensors, staged_layers, strict=True):
-            self._copy_layer_blocks(
-                src_layer=src_layer,
-                dst_layer=dst_layer,
-                selected_blocks=selected_blocks,
-                engine_kv_format=engine_kv_format,
-                block_size=block_size,
-            )
+        self._batched_copy_blocks_d2h(
+            src_layers=layer_tensors,
+            dst_layers=staged_layers,
+            selected_blocks=selected_blocks,
+            engine_kv_format=engine_kv_format,
+            block_size=block_size,
+        )
 
         compact_page_buffer_size = compact_num_blocks * block_size
         device_ops.multi_layer_kv_transfer(
@@ -202,137 +201,97 @@ class NeuronNixlBlockStager:
             skip_prefix_n_tokens=skip_prefix_n_tokens,
         )
 
-        for staged_layer, device_layer in zip(
-            staged_layers, layer_tensors, strict=True
-        ):
-            self._write_layer_blocks(
-                src_layer=staged_layer,
-                dst_layer=device_layer,
-                selected_blocks=selected_blocks,
-                engine_kv_format=engine_kv_format,
-                block_size=block_size,
-            )
-
-    def _write_layer_blocks(
-        self,
-        src_layer: torch.Tensor,
-        dst_layer: torch.Tensor,
-        selected_blocks: list[int],
-        engine_kv_format: "lmcache_native.EngineKVFormat",
-        block_size: int,
-    ) -> None:
-        """NIXL WRITE: CPU staging tensor → selected blocks on device."""
-        self._write_layer_blocks_via_vllm_wrapper(
-            src_layer=src_layer,
-            dst_layer=dst_layer,
+        self._batched_copy_blocks_h2d(
+            src_layers=staged_layers,
+            dst_layers=layer_tensors,
             selected_blocks=selected_blocks,
             engine_kv_format=engine_kv_format,
             block_size=block_size,
         )
 
-    def _write_layer_blocks_via_vllm_wrapper(
+    def _batched_copy_blocks_h2d(
         self,
-        src_layer: torch.Tensor,
-        dst_layer: torch.Tensor,
+        src_layers: list[torch.Tensor],
+        dst_layers: list[torch.Tensor],
         selected_blocks: list[int],
         engine_kv_format: "lmcache_native.EngineKVFormat",
         block_size: int,
     ) -> None:
-        """NIXL WRITE via vLLM NixlWrapper: CPU → device blocks."""
-        src_wrapper = self._ensure_dst_wrapper()
-        dst_wrapper = self._ensure_src_wrapper()
-        src_mem_type = "DRAM"
-        dst_mem_type = "VRAM"
+        """Batch all layers into one NIXL WRITE: CPU → device."""
+        cpu_wrapper = self._ensure_dst_wrapper()
+        dev_wrapper = self._ensure_src_wrapper()
 
-        src_nbytes = _view_nbytes(src_layer)
-        dst_nbytes = _view_nbytes(dst_layer)
-        src_reg_descs = src_wrapper.get_reg_descs(
-            [(int(src_layer.data_ptr()), src_nbytes, 0, "")],
-            src_mem_type,
-        )
-        dst_reg_descs = dst_wrapper.get_reg_descs(
-            [(int(dst_layer.data_ptr()), dst_nbytes, _tensor_device_id(dst_layer), "")],
-            dst_mem_type,
-        )
-        src_wrapper.register_memory(src_reg_descs, backends=self.backends)
-        dst_wrapper.register_memory(dst_reg_descs, backends=self.backends)
+        all_cpu_reg_tuples: list[tuple[int, int, int, str]] = []
+        all_dev_reg_tuples: list[tuple[int, int, int, str]] = []
+        all_cpu_regions: list[_TransferRegion] = []
+        all_dev_regions: list[_TransferRegion] = []
 
-        src_regions = self._regions_for_tensor(
-            src_layer,
-            list(range(len(selected_blocks))),
-            engine_kv_format,
-            block_size,
+        for src_layer, dst_layer in zip(src_layers, dst_layers, strict=True):
+            all_cpu_reg_tuples.append(
+                (int(src_layer.data_ptr()), _view_nbytes(src_layer), 0, "")
+            )
+            all_dev_reg_tuples.append(
+                (int(dst_layer.data_ptr()), _view_nbytes(dst_layer),
+                 _tensor_device_id(dst_layer), "")
+            )
+            all_cpu_regions.extend(self._regions_for_tensor(
+                src_layer, list(range(len(selected_blocks))),
+                engine_kv_format, block_size,
+            ))
+            all_dev_regions.extend(self._regions_for_tensor(
+                dst_layer, selected_blocks, engine_kv_format, block_size,
+            ))
+
+        cpu_reg_descs = cpu_wrapper.get_reg_descs(all_cpu_reg_tuples, "DRAM")
+        dev_reg_descs = dev_wrapper.get_reg_descs(all_dev_reg_tuples, "VRAM")
+        cpu_wrapper.register_memory(cpu_reg_descs, backends=self.backends)
+        dev_wrapper.register_memory(dev_reg_descs, backends=self.backends)
+
+        cpu_descs = dev_wrapper.get_xfer_descs(
+            [(r.addr, r.size_bytes, r.device_id) for r in all_cpu_regions], "DRAM",
         )
-        dst_regions = self._regions_for_tensor(
-            dst_layer, selected_blocks, engine_kv_format, block_size
+        dev_descs = dev_wrapper.get_xfer_descs(
+            [(r.addr, r.size_bytes, r.device_id) for r in all_dev_regions], "VRAM",
         )
 
-        src_descs = dst_wrapper.get_xfer_descs(
-            [(r.addr, r.size_bytes, r.device_id) for r in src_regions],
-            src_mem_type,
+        remote_agent_name = dev_wrapper.add_remote_agent(
+            cpu_wrapper.get_agent_metadata()
         )
-        dst_descs = dst_wrapper.get_xfer_descs(
-            [(r.addr, r.size_bytes, r.device_id) for r in dst_regions],
-            dst_mem_type,
-        )
-        remote_agent_name = None
-        src_handle = None
-        dst_handle = None
-        remote_agent_name = dst_wrapper.add_remote_agent(
-            src_wrapper.get_agent_metadata()
-        )
-        src_handle = dst_wrapper.prep_xfer_dlist(remote_agent_name, src_descs)
-        dst_handle = dst_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", dst_descs)
+        cpu_handle = dev_wrapper.prep_xfer_dlist(remote_agent_name, cpu_descs)
+        dev_handle = dev_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", dev_descs)
         xfer_handle = None
         try:
-            indices = list(range(len(src_regions)))
-            xfer_handle = dst_wrapper.make_prepped_xfer(
-                "WRITE",
-                src_handle,
-                indices,
-                dst_handle,
-                indices,
-                b"lmcache-neuron-h2d-staging",
+            indices = list(range(len(all_cpu_regions)))
+            xfer_handle = dev_wrapper.make_prepped_xfer(
+                "WRITE", cpu_handle, indices, dev_handle, indices,
+                b"lmcache-neuron-batched-h2d",
             )
-            state = dst_wrapper.transfer(xfer_handle)
+            state = dev_wrapper.transfer(xfer_handle)
             deadline = time.monotonic() + 30.0
             while state not in ("DONE", "ERR"):
                 if time.monotonic() > deadline:
-                    raise RuntimeError(
-                        "NIXL WRITE timed out after 30s for staged KV block scatter"
-                    )
-                state = dst_wrapper.check_xfer_state(xfer_handle)
+                    raise RuntimeError("NIXL batched WRITE timed out after 30s")
+                state = dev_wrapper.check_xfer_state(xfer_handle)
             if state != "DONE":
-                raise RuntimeError(
-                    f"NIXL WRITE failed for staged KV block scatter: state={state}"
-                )
+                raise RuntimeError(f"NIXL batched WRITE failed: state={state}")
         except Exception:
             logger.exception(
-                "Neuron NIXL H2D staging failed: selected_blocks=%s src_nbytes=%d "
-                "dst_nbytes=%d src_regions=%s dst_regions=%s",
-                selected_blocks,
-                src_nbytes,
-                dst_nbytes,
-                [(r.addr, r.size_bytes, r.device_id) for r in src_regions],
-                [(r.addr, r.size_bytes, r.device_id) for r in dst_regions],
+                "Neuron NIXL batched H2D failed: %d layers, %d blocks, "
+                "%d total regions",
+                len(src_layers), len(selected_blocks), len(all_cpu_regions),
             )
             raise
         finally:
             if xfer_handle is not None:
-                dst_wrapper.release_xfer_handle(xfer_handle)
-            if src_handle is not None:
-                dst_wrapper.release_dlist_handle(src_handle)
-            if dst_handle is not None:
-                dst_wrapper.release_dlist_handle(dst_handle)
-            if (
-                remote_agent_name is not None
-                and hasattr(dst_wrapper, "remove_remote_agent")
-            ):
-                dst_wrapper.remove_remote_agent(remote_agent_name)
-            if hasattr(src_wrapper, "deregister_memory"):
-                src_wrapper.deregister_memory(src_reg_descs)
-            if hasattr(dst_wrapper, "deregister_memory"):
-                dst_wrapper.deregister_memory(dst_reg_descs)
+                dev_wrapper.release_xfer_handle(xfer_handle)
+            dev_wrapper.release_dlist_handle(cpu_handle)
+            dev_wrapper.release_dlist_handle(dev_handle)
+            if hasattr(dev_wrapper, "remove_remote_agent"):
+                dev_wrapper.remove_remote_agent(remote_agent_name)
+            if hasattr(cpu_wrapper, "deregister_memory"):
+                cpu_wrapper.deregister_memory(cpu_reg_descs)
+            if hasattr(dev_wrapper, "deregister_memory"):
+                dev_wrapper.deregister_memory(dev_reg_descs)
 
     def _ensure_agent(self):
         if self._agent is not None:
@@ -359,133 +318,51 @@ class NeuronNixlBlockStager:
             self._dst_wrapper = self._create_wrapper()
         return self._dst_wrapper
 
-    def _copy_layer_blocks(
+    def _batched_copy_blocks_d2h(
         self,
-        src_layer: torch.Tensor,
-        dst_layer: torch.Tensor,
+        src_layers: list[torch.Tensor],
+        dst_layers: list[torch.Tensor],
         selected_blocks: list[int],
         engine_kv_format: "lmcache_native.EngineKVFormat",
         block_size: int,
     ) -> None:
-        device_type = str(src_layer.device).split(":")[0]
-        if device_type == "neuron":
-            self._copy_layer_blocks_via_vllm_wrapper(
-                src_layer=src_layer,
-                dst_layer=dst_layer,
-                selected_blocks=selected_blocks,
-                engine_kv_format=engine_kv_format,
-                block_size=block_size,
-            )
-            return
-
-        agent = self._ensure_agent()
-        src_mem_type = "VRAM"
-        dst_mem_type = "DRAM"
-
-        src_nbytes = _view_nbytes(src_layer)
-        dst_nbytes = _view_nbytes(dst_layer)
-        src_reg = agent.register_memory(
-            [(int(src_layer.data_ptr()), src_nbytes, _tensor_device_id(src_layer), "")],
-            mem_type=src_mem_type,
-        )
-        dst_reg = agent.register_memory(
-            [(int(dst_layer.data_ptr()), dst_nbytes, 0, "")],
-            mem_type=dst_mem_type,
-        )
-        src_regions = self._regions_for_tensor(
-            src_layer, selected_blocks, engine_kv_format, block_size
-        )
-        dst_regions = self._regions_for_tensor(
-            dst_layer,
-            list(range(len(selected_blocks))),
-            engine_kv_format,
-            block_size,
-        )
-        src_descs = agent.get_xfer_descs(
-            [(r.addr, r.size_bytes, r.device_id) for r in src_regions],
-            mem_type=src_mem_type,
-        )
-        dst_descs = agent.get_xfer_descs(
-            [(r.addr, r.size_bytes, r.device_id) for r in dst_regions],
-            mem_type=dst_mem_type,
-        )
-        src_handle = agent.prep_xfer_dlist("", src_descs, mem_type=src_mem_type)
-        dst_handle = agent.prep_xfer_dlist("", dst_descs, mem_type=dst_mem_type)
-        xfer_handle = None
-        try:
-            indices = list(range(len(src_regions)))
-            xfer_handle = agent.make_prepped_xfer(
-                "READ",
-                dst_handle,
-                indices,
-                src_handle,
-                indices,
-            )
-            state = agent.transfer(xfer_handle)
-            deadline = time.monotonic() + 30.0
-            while state not in ("DONE", "ERR"):
-                if time.monotonic() > deadline:
-                    raise RuntimeError(
-                        "NIXL READ timed out after 30s for staged KV block copy"
-                    )
-                state = agent.check_xfer_state(xfer_handle)
-            if state != "DONE":
-                raise RuntimeError(
-                    f"NIXL READ failed for staged KV block copy: state={state}"
-                )
-        finally:
-            if xfer_handle is not None:
-                agent.release_xfer_handle(xfer_handle)
-            agent.deregister_memory(src_reg)
-            agent.deregister_memory(dst_reg)
-
-    def _copy_layer_blocks_via_vllm_wrapper(
-        self,
-        src_layer: torch.Tensor,
-        dst_layer: torch.Tensor,
-        selected_blocks: list[int],
-        engine_kv_format: "lmcache_native.EngineKVFormat",
-        block_size: int,
-    ) -> None:
+        """Batch all layers into one NIXL READ: device → CPU."""
         src_wrapper = self._ensure_src_wrapper()
         dst_wrapper = self._ensure_dst_wrapper()
-        src_mem_type = "VRAM"
-        dst_mem_type = "DRAM"
 
-        src_nbytes = _view_nbytes(src_layer)
-        dst_nbytes = _view_nbytes(dst_layer)
-        src_reg_descs = src_wrapper.get_reg_descs(
-            [(int(src_layer.data_ptr()), src_nbytes, _tensor_device_id(src_layer), "")],
-            src_mem_type,
-        )
-        dst_reg_descs = dst_wrapper.get_reg_descs(
-            [(int(dst_layer.data_ptr()), dst_nbytes, 0, "")],
-            dst_mem_type,
-        )
+        all_src_reg_tuples: list[tuple[int, int, int, str]] = []
+        all_dst_reg_tuples: list[tuple[int, int, int, str]] = []
+        all_src_regions: list[_TransferRegion] = []
+        all_dst_regions: list[_TransferRegion] = []
+
+        for src_layer, dst_layer in zip(src_layers, dst_layers, strict=True):
+            all_src_reg_tuples.append(
+                (int(src_layer.data_ptr()), _view_nbytes(src_layer),
+                 _tensor_device_id(src_layer), "")
+            )
+            all_dst_reg_tuples.append(
+                (int(dst_layer.data_ptr()), _view_nbytes(dst_layer), 0, "")
+            )
+            all_src_regions.extend(self._regions_for_tensor(
+                src_layer, selected_blocks, engine_kv_format, block_size,
+            ))
+            all_dst_regions.extend(self._regions_for_tensor(
+                dst_layer, list(range(len(selected_blocks))),
+                engine_kv_format, block_size,
+            ))
+
+        src_reg_descs = src_wrapper.get_reg_descs(all_src_reg_tuples, "VRAM")
+        dst_reg_descs = dst_wrapper.get_reg_descs(all_dst_reg_tuples, "DRAM")
         src_wrapper.register_memory(src_reg_descs, backends=self.backends)
         dst_wrapper.register_memory(dst_reg_descs, backends=self.backends)
 
-        src_regions = self._regions_for_tensor(
-            src_layer, selected_blocks, engine_kv_format, block_size
-        )
-        dst_regions = self._regions_for_tensor(
-            dst_layer,
-            list(range(len(selected_blocks))),
-            engine_kv_format,
-            block_size,
-        )
-
         src_descs = dst_wrapper.get_xfer_descs(
-            [(r.addr, r.size_bytes, r.device_id) for r in src_regions],
-            src_mem_type,
+            [(r.addr, r.size_bytes, r.device_id) for r in all_src_regions], "VRAM",
         )
         dst_descs = dst_wrapper.get_xfer_descs(
-            [(r.addr, r.size_bytes, r.device_id) for r in dst_regions],
-            dst_mem_type,
+            [(r.addr, r.size_bytes, r.device_id) for r in all_dst_regions], "DRAM",
         )
-        remote_agent_name = None
-        src_handle = None
-        dst_handle = None
+
         remote_agent_name = dst_wrapper.add_remote_agent(
             src_wrapper.get_agent_metadata()
         )
@@ -493,50 +370,32 @@ class NeuronNixlBlockStager:
         dst_handle = dst_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", dst_descs)
         xfer_handle = None
         try:
-            indices = list(range(len(src_regions)))
+            indices = list(range(len(all_src_regions)))
             xfer_handle = dst_wrapper.make_prepped_xfer(
-                "READ",
-                dst_handle,
-                indices,
-                src_handle,
-                indices,
-                b"lmcache-neuron-staging",
+                "READ", dst_handle, indices, src_handle, indices,
+                b"lmcache-neuron-batched-d2h",
             )
-            import time
-
             state = dst_wrapper.transfer(xfer_handle)
             deadline = time.monotonic() + 30.0
             while state not in ("DONE", "ERR"):
                 if time.monotonic() > deadline:
-                    raise RuntimeError(
-                        "NIXL READ timed out after 30s for staged KV block copy"
-                    )
+                    raise RuntimeError("NIXL batched READ timed out after 30s")
                 state = dst_wrapper.check_xfer_state(xfer_handle)
             if state != "DONE":
-                raise RuntimeError(
-                    f"NIXL READ failed for staged KV block copy: state={state}"
-                )
+                raise RuntimeError(f"NIXL batched READ failed: state={state}")
         except Exception:
             logger.exception(
-                "Neuron NIXL staging failed: selected_blocks=%s src_nbytes=%d "
-                "dst_nbytes=%d src_regions=%s dst_regions=%s",
-                selected_blocks,
-                src_nbytes,
-                dst_nbytes,
-                [(r.addr, r.size_bytes, r.device_id) for r in src_regions],
-                [(r.addr, r.size_bytes, r.device_id) for r in dst_regions],
+                "Neuron NIXL batched D2H failed: %d layers, %d blocks, "
+                "%d total regions",
+                len(src_layers), len(selected_blocks), len(all_src_regions),
             )
             raise
         finally:
             if xfer_handle is not None:
                 dst_wrapper.release_xfer_handle(xfer_handle)
-            if src_handle is not None:
-                dst_wrapper.release_dlist_handle(src_handle)
-            if dst_handle is not None:
-                dst_wrapper.release_dlist_handle(dst_handle)
-            if remote_agent_name is not None and hasattr(
-                dst_wrapper, "remove_remote_agent"
-            ):
+            dst_wrapper.release_dlist_handle(src_handle)
+            dst_wrapper.release_dlist_handle(dst_handle)
+            if hasattr(dst_wrapper, "remove_remote_agent"):
                 dst_wrapper.remove_remote_agent(remote_agent_name)
             if hasattr(src_wrapper, "deregister_memory"):
                 src_wrapper.deregister_memory(src_reg_descs)
