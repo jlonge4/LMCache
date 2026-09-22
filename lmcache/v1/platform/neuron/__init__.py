@@ -152,7 +152,10 @@ class NeuronDeviceSpec(DeviceSpec):
 
     @property
     def ops_cls(self) -> type[DeviceOps]:
-        return DeviceOps
+        # First Party
+        from lmcache.v1.platform.neuron.device_ops import NeuronDeviceOps
+
+        return NeuronDeviceOps
 
     def is_available(self) -> bool:
         """Check Neuron availability.

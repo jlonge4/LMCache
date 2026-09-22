@@ -168,6 +168,11 @@ def CreateGPUConnector(
         enable_neuron_kv_staging = torch_device_type == "neuron" and bool(
             config.get_extra_config_value("neuron_use_kv_staging", True)
         )
+        enable_neuron_nki = torch_device_type == "neuron" and bool(
+            config.get_extra_config_value("neuron_use_nki", False)
+        )
+        if enable_neuron_nki:
+            enable_neuron_kv_staging = False
 
         if torch_device_type in ("cuda", "neuron"):
             # First Party
@@ -181,9 +186,9 @@ def CreateGPUConnector(
             if config.use_layerwise and torch_device_type == "neuron":
                 raise ValueError(
                     "config.use_layerwise is not supported on Neuron. The "
-                    "layerwise connectors transfer paged KV directly, which "
-                    "Neuron cannot do -- its blocks must be staged through a "
-                    "contiguous host buffer first. Unset use_layerwise."
+                    "Neuron staging and NKI implementations both transfer the "
+                    "whole model KV tensor through the non-layerwise connector. "
+                    "Unset use_layerwise."
                 )
 
             if config.use_layerwise:
