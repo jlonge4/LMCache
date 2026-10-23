@@ -1,0 +1,14 @@
+engine 1: generated ' KV cache in HBM, and LMCache offloads it to host RAM.'
+engine 2: generated ' KV cache in HBM, and LMCache offloads it to host RAM.'
+
+per-engine value                engine 1  engine 2    expected
+server l1_write_chunks                 4         0       4 / 0
+server l1_read_chunks                  0         4       0 / 4
+server lookup_requested_tokens      1024      1024 1024 / 1024
+server lookup_hit_tokens               0      1024    0 / 1024
+server lookup_hit_l1_tokens            0      1024    0 / 1024
+vllm cached prompt tokens              0      1024    0 / 1024
+
+engine outputs identical: True
+RESULT: PASS  (logs: /tmp/neuron_offload_run/logs)
+exit_code=0 wall_seconds=236

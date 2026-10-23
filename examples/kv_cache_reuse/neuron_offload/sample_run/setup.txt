@@ -1,0 +1,15 @@
+image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04
+instance: trn2.48xlarge
+python 3.14.6, torch 2.13.0, vllm 0.29.0, vllm-neuron 0.29.0.1.2.0, libtorch-neuronx-lite 2.13.0.1.0.3112
+--- step 1: lmcache (dev ff9185d4 + vLLM layout fix)
+lmcache install exit=0
+--- step 2: missing runtime imports
+missing: sortedcontainers
+missing: opentelemetry.exporter.prometheus
+  otel sdk=1.45.1 semconv=0.66b1
+all imports ok
+--- package changes
+> lmcache                                  0.5.7.dev150
+> opentelemetry-exporter-prometheus        0.66b1
+> sortedcontainers                         2.4.0
+--- step 3: run

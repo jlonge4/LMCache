@@ -1,0 +1,1 @@
+{"token_ids": [85748, 6636, 304, 473, 30042, 11, 323, 47514, 8397, 1022, 33785, 433, 311, 3552, 22813, 13], "text": " KV cache in HBM, and LMCache offloads it to host RAM.", "num_cached_tokens": 0}
